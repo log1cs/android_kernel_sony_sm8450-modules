@@ -139,6 +139,9 @@ static int cam_ife_csid_validate_rdi_format(uint32_t in_format,
 	case CAM_FORMAT_MIPI_RAW_12:
 		switch (out_format) {
 		case CAM_FORMAT_MIPI_RAW_12:
+/* sony extension begin */
+		case CAM_FORMAT_PLAIN128:
+/* sony extension end */
 		case CAM_FORMAT_PLAIN16_12:
 		case CAM_FORMAT_PLAIN16_16:
 			break;
@@ -305,6 +308,12 @@ int cam_ife_csid_get_format_rdi(
 		rc = -EINVAL;
 		goto err;
 	}
+
+/* sony extension begin */
+	if (in_format==CAM_FORMAT_MIPI_RAW_12 && out_format==CAM_FORMAT_PLAIN128) {
+		path_format->decode_fmt = 0xf;
+	}
+/* sony extension end */
 
 end:
 	CAM_DBG(CAM_ISP,
