@@ -64,6 +64,8 @@ enum msm_vidc_core_state {
 	MSM_VIDC_CORE_INIT         = 2,
 };
 
+#define SUBSYS_CRASH_REASON_LEN 512
+
 struct msm_vidc_platform_ops {
 	u32 (*buffer_region)(struct msm_vidc_inst *inst,
 		enum msm_vidc_buffer_type buffer_type, const char *func);
@@ -123,6 +125,7 @@ struct msm_vidc_core {
 	bool                                   handoff_done;
 	bool                                   hw_power_control;
 	bool                                   pm_suspended;
+	char crash_reason_buf[SUBSYS_CRASH_REASON_LEN];
 };
 
 #endif // _MSM_VIDC_CORE_H_
