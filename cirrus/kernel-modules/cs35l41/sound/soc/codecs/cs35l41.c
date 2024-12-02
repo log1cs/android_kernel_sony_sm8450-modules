@@ -301,7 +301,7 @@ static int cs35l41_dsp_load_ev(struct snd_soc_dapm_widget *w,
 		break;
 	}
 
-	return 0;
+	return ret;
 }
 
 static int cs35l41_halo_booted_get(struct snd_kcontrol *kcontrol,
@@ -503,7 +503,7 @@ static int cs35l41_ccm_reset_put(struct snd_kcontrol *kcontrol,
 			0x3, 0x3);
 	}
 
-	return 0;
+	return ret;
 }
 
 static int cs35l41_hibernate_force_wake_get(struct snd_kcontrol *kcontrol,
@@ -1764,7 +1764,7 @@ static irqreturn_t cs35l41_irq(int irq, void *data)
 	unsigned int masks[4] = {0, 0, 0, 0};
 	unsigned int i;
 	unsigned int mbox_3_val, mbox_3_cmd, mbox_3_data;
-	int ret;
+	// int ret;
 
 	for (i = 0; i < ARRAY_SIZE(status); i++) {
 		regmap_read(cs35l41->regmap,
@@ -1901,7 +1901,7 @@ static irqreturn_t cs35l41_irq(int irq, void *data)
 		mbox_3_data = (mbox_3_val & CS35L41_MBOX3_DATA_MASK) >>
 			      CS35L41_MBOX3_DATA_SHIFT;
 
-		ret = cs35l41_handle_dsp_event(cs35l41, mbox_3_cmd,
+		/* ret = */ cs35l41_handle_dsp_event(cs35l41, mbox_3_cmd,
 					       mbox_3_data);
 
 		regmap_write(cs35l41->regmap, CS35L41_IRQ1_STATUS2,
