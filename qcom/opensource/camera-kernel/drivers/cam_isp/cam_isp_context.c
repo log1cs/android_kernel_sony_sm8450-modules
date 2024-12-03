@@ -2870,7 +2870,6 @@ notify_only:
 		ctx_isp->last_sof_timestamp = ctx_isp->sof_timestamp_val;
 /* sony extension end */
 	}
-
 /* sony extension begin */
 #if 0
 	ctx_isp->last_sof_timestamp = ctx_isp->sof_timestamp_val;
@@ -5477,7 +5476,6 @@ static int __cam_isp_ctx_rdi_only_sof_in_top_state(
 		CAM_DBG(CAM_ISP, "next substate %d", ctx_isp->substate_activated);
 	} else {
 /* sony extension end */
-/* section below until the next sony extension was moved by setting it under else */
 		/*
 		 * notify reqmgr with sof signal. Note, due to scheduling delay
 		 * we can run into situation that two active requests has already
