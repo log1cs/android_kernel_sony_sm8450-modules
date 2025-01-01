@@ -21,26 +21,23 @@
 *
 *  etxxx_fp.c
 *  Date: 2016/03/16
-*  Version: 0.9.0.1
-*  Revise Date:  2020/11/25
-*  Copyright (C) 2007-2019 Egis Technology Inc.
-* -----------------  version history ------------------------
+*  Version: 0.9.0.2
+*  Revise Date:  2021/12/06
+*  Copyright (C) 2007-2021 Egis Technology Inc.
+* -----------------  version history ----------------------------------------------------
 * <Author>		<Data>			<Desc>
-*Kevin.Liang	20181102		add powersetup for IOC
-*Jacob.Kung		20201125		modify for support all sensor
-*Jacob.Kung		20201126		modify struct define naming
-*Jacob.Kung		20201130		add check_ioctl_permission
-*Jacob.Kung		20201207		register platform driver with MTK platform
-*Jacob.Kung		20210331		add register FB notifier
-*Jacob.Kung		20210512		add register DRM notifier
-* -----------------------------------------------------------
+* Jacob.Kung          20211126        Disabled irq wake when free all interrupt resource.
+* ---------------------------------------------------------------------------------------
 *
 **/
-#include <linux/version.h>
+
+
 #include <linux/interrupt.h>
+#ifdef CONFIG_OF
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
+#endif
 #include <linux/gpio.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
@@ -56,166 +53,273 @@
 #include <linux/of_gpio.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
+#include <linux/fb.h>
 #include <linux/pm_wakeup.h>
 #include "etxxx_fp.h"
-#include <linux/input.h>
-#ifdef CONFIG_COMPAT
-#include <linux/compat.h>
+
+#ifdef MTK_PLATFORM
+extern void mt_spi_enable_master_clk(struct spi_device *spidev);
+extern void mt_spi_disable_master_clk(struct spi_device *spidev);
 #endif
 
+/*
+ * FPS interrupt table
+ */
+struct interrupt_desc fps_ints = {0, 0, "BUT0", 0};
+unsigned int bufsiz = 4096;
+struct regulator *buck;
 
-struct egisfp_dev_t *g_data = NULL;
+#define EDGE_TRIGGER_FALLING    0x0
+#define EDGE_TRIGGER_RISING    0x1
+#define LEVEL_TRIGGER_LOW       0x2
+#define LEVEL_TRIGGER_HIGH      0x3
+#define WAKE_HOLD_TIME    2000//ms
+int egistec_platformInit(struct egistec_data *egistec);
+int egistec_platformFree(struct egistec_data *egistec);
+struct ioctl_cmd {
+int int_mode;
+int detect_period;
+int detect_threshold;
+};
+int g_screen_onoff = 1;
+struct egistec_data *g_data;
 DECLARE_BITMAP(minors, N_SPI_MINORS);
 LIST_HEAD(device_list);
 DEFINE_MUTEX(device_list_lock);
 
-static struct egis_key_map_t key_maps[] = {
-	{EV_KEY, EGIS_NAV_INPUT_UP},
-	{EV_KEY, EGIS_NAV_INPUT_DOWN},
-	{EV_KEY, EGIS_NAV_INPUT_LEFT},
-	{EV_KEY, EGIS_NAV_INPUT_RIGHT},
-	{EV_KEY, EGIS_NAV_INPUT_CLICK},
-	{EV_KEY, EGIS_NAV_INPUT_DOUBLE_CLICK},
-	{EV_KEY, EGIS_NAV_INPUT_LONG_PRESS},
-	{EV_KEY, EGIS_NAV_INPUT_FINGER_DOWN},
-	{EV_KEY, EGIS_NAV_INPUT_FINGER_UP},
+
+struct reset_config {
+	char *name;
+	unsigned int low1;
+	unsigned int hi1;
+	unsigned int low2;
+	unsigned int hi2;
 };
 
-int egisfp_probe(struct platform_device *pdev);
-int egisfp_remove(struct platform_device *pdev);
-
-/* -------------------------------------------------------------------- */
-
-struct of_device_id egistec_match_table[] = {
-	{
-		.compatible = "fp-egistec",
-	},
-	{},
-};
-
-static struct platform_driver egisfp_driver = {
-	.driver = {
-		.name = EGIS_DEV_NAME,
-		.owner = THIS_MODULE,
-		.of_match_table = egistec_match_table,
-	},
-	.probe = egisfp_probe,
-	.remove = egisfp_remove,
+static const struct reset_config reset_config[] = {
+{ "ET713", 2, 2, 13, 8},
+{ "ET702", 2, 2, 4, 1},
 };
 
 /* add for clk enable from kernel*/
+#ifdef SAMSUNG_PLATFORM
+static void exyons_spi_clock_set(struct egis_data *data, int speed)
+{
+	int rc = 0;
 
+	rc = clk_set_rate(data->core_clk, speed);
+	if (rc != 0) {
+		DEBUG_PRINT("[egis] %s   egis_spi_core_clk_set = %d  fail \n", __func__, speed);
+	}
+
+	rc = clk_set_rate(data->iface_clk, speed);
+	if (rc != 0) {
+		DEBUG_PRINT("[egis] %s   egis_spi_iface_clk_set = %d  fail \n", __func__, speed);
+	}
+	data->clk_speed = speed;
+}
+
+static int exyons_clk_init(struct device *dev, struct egis_data *data)
+{
+	pr_debug("%s: enter\n", __func__);
+
+	data->clk_enabled = 0;
+	data->core_clk = clk_get(dev, "gate_spi_clk"/*"spi"*/);
+	if (IS_ERR_OR_NULL(data->core_clk)) {
+		pr_err("%s: fail to get core_clk\n", __func__);
+		return -EPERM;
+	}
+	data->iface_clk = clk_get(dev, "ipclk_spi"/*"spi_busclk0"*/);
+	if (IS_ERR_OR_NULL(data->iface_clk)) {
+		pr_err("%s: fail to get iface_clk\n", __func__);
+		clk_put(data->core_clk);
+		data->core_clk = NULL;
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
+static int exyons_clk_enable(struct egis_data *data)
+{
+	pr_debug("%s: enter\n", __func__);
+
+	if (data->clk_enabled) {
+		pr_warn("%s warning: spi clock is already enabled, return!\n", __func__);
+		return 0;
+	}
+
+	clk_prepare_enable(data->core_clk);
+
+	clk_prepare_enable(data->iface_clk);
+
+	exyons_spi_clock_set(data, SPI_DEFAULT_SPEED);
+	pinctrl_select_state(data->pinctrl, data->spi_active);
+	data->clk_enabled = 1;
+
+	pr_debug("%s: exit\n", __func__);
+
+	return 0;
+}
+
+static int exyons_clk_disable(struct egis_data *data)
+{
+	pr_debug("%s: enter\n", __func__);
+
+	if (!data->clk_enabled)
+		return 0;
+
+	clk_disable_unprepare(data->core_clk);
+	clk_disable_unprepare(data->iface_clk);
+	pinctrl_select_state(data->pinctrl, data->spi_default);
+	data->clk_enabled = 0;
+	return 0;
+}
+
+static int exyons_clk_uninit(struct egis_data *data)
+{
+	pr_debug("%s: enter\n", __func__);
+
+	if (data->clk_enabled)
+		exyons_clk_disable(data);
+
+	if (!IS_ERR_OR_NULL(data->core_clk)) {
+		clk_put(data->core_clk);
+		data->core_clk = NULL;
+	}
+
+	if (!IS_ERR_OR_NULL(data->iface_clk)) {
+		clk_put(data->iface_clk);
+		data->iface_clk = NULL;
+	}
+
+	return 0;
+}
+
+#endif
+
+#if defined(MTK_PLATFORM) || defined(SAMSUNG_PLATFORM)
+void spi_clk_enable(struct egis_data *data, bool bonoff)
+{
+	if (bonoff) {
+		pr_info("EGISTEC %s line:%d enable spi clk\n", __func__, __LINE__);
+#ifdef MTK_PLATFORM
+		if (data->spi)
+			mt_spi_enable_master_clk(data->spi);
+		else
+			pr_err("EGISTEC %s line:%d enable spi clk fail: g_data->spi is NULL \n", __func__, __LINE__);
+#else
+		exyons_clk_enable(data);
+#endif
+	} else 	{
+		pr_info("EGISTEC %s line:%d disable spi clk\n", __func__, __LINE__);
+#ifdef MTK_PLATFORM
+		if (data->spi)
+			mt_spi_disable_master_clk(data->spi);
+		else
+			pr_err("EGISTEC %s line:%d disable spi clk fail: g_data->spi is NULL \n", __func__, __LINE__);
+#else
+		exyons_clk_disable(data);
+#endif
+	}
+}
+#endif
 
 /* add for clk enable from kernel*/
 
 /* ------------------------------ Interrupt -----------------------------*/
+/*
+ * Interrupt description
+ */
 
-void egisfp_interrupt_enable(struct egisfp_dev_t *egis_dev, int enable_mode)
+void egisfp_interrupt_enable(struct egistec_data *egistec, int enable_mode)
 {
 	unsigned long irqflags;
-	if (egis_dev->request_irq_done == 0)
-	{
+	if (egistec->request_irq_done == 0) {
 		return;
 	}
-	spin_lock_irqsave(&egis_dev->irq_lock, irqflags);
-	DEBUG_PRINT(" %s : %s \n", __func__, enable_mode?"enable":"disable");
+	spin_lock_irqsave(&egistec->irq_lock, irqflags);
+	DEBUG_PRINT("EGISTEC %s : %s \n", __func__, enable_mode?"enable":"disable");
 	if (enable_mode)
 	{
-		if (!egis_dev->fps_ints.irq_wakeup_enable) {
-			enable_irq_wake(egis_dev->gpio_irq);
-			egis_dev->fps_ints.irq_wakeup_enable = DRDY_IRQ_ENABLE;
-		}
-		if (egis_dev->fps_ints.drdy_irq_flag == DRDY_IRQ_DISABLE)
+		if (fps_ints.drdy_irq_flag == DRDY_IRQ_DISABLE)
 		{
-			egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_ENABLE;
-			enable_irq(egis_dev->gpio_irq);
+			fps_ints.drdy_irq_flag = DRDY_IRQ_ENABLE;
+			enable_irq_wake(egistec->gpio_irq);
+			enable_irq(egistec->gpio_irq);
 		}
 	}
 	else
 	{
-		if (egis_dev->fps_ints.drdy_irq_flag == DRDY_IRQ_ENABLE)
+		if (fps_ints.drdy_irq_flag == DRDY_IRQ_ENABLE)
 		{
-			disable_irq_nosync(egis_dev->gpio_irq);
-			egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
-		}
-		if (egis_dev->fps_ints.irq_wakeup_enable) {
-			disable_irq_wake(egis_dev->gpio_irq);
-			egis_dev->fps_ints.irq_wakeup_enable = DRDY_IRQ_DISABLE;
+			disable_irq_nosync(egistec->gpio_irq);
+			disable_irq_wake(egistec->gpio_irq);
+			fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
 		}
 	}
-	spin_unlock_irqrestore(&egis_dev->irq_lock, irqflags);
+	spin_unlock_irqrestore(&egistec->irq_lock, irqflags);
 }
+
+
+#define FP_INT_DETECTION_PERIOD  10
+#define FP_DETECTION_THRESHOLD  10
 
 static DECLARE_WAIT_QUEUE_HEAD(interrupt_waitq);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-void egisfp_interrupt_timer_call(struct timer_list *t)
+/*
+ *	FUNCTION NAME.
+ *		interrupt_timer_routine
+ *
+ *	FUNCTIONAL DESCRIPTION.
+ *		basic interrupt timer inital routine
+ *
+ *	ENTRY PARAMETERS.
+ *		gpio - gpio address
+ *
+ *	EXIT PARAMETERS.
+ *		Function Return
+ */
+
+void interrupt_timer_routine(struct timer_list *unused)
 {
-	struct egisfp_interrupt_desc_t *fps_int = from_timer(fps_int, t, timer);
-	struct egisfp_dev_t *egis_dev;
+	DEBUG_PRINT("EGISTEC FPS interrupt count = %d \n", fps_ints.int_count);
 
-	egis_dev = container_of(fps_int, struct egisfp_dev_t, fps_ints);
-	INFO_PRINT(" %s : interrupt count = %d \n", __func__, egis_dev->fps_ints.int_count);
-
-	if (egis_dev->fps_ints.int_count >= egis_dev->fps_ints.detect_threshold)
-	{
-		egis_dev->fps_ints.finger_on = 1;
-		INFO_PRINT(" %s : interrupt triggered \n", __func__);
+	if (fps_ints.int_count >= fps_ints.detect_threshold) {
+		fps_ints.finger_on = 1;
+		DEBUG_PRINT("EGISTEC FPS triggered !!!!!!!\n");
+	} else {
+		DEBUG_PRINT("EGISTEC FPS not triggered !!!!!!!\n");
 	}
-	else
-	{
-		INFO_PRINT(" %s : interrupt not triggered \n", __func__);
-	}
-	egis_dev->fps_ints.int_count = 0;
+	fps_ints.int_count = 0;
 	wake_up_interruptible(&interrupt_waitq);
 }
-#else
-void egisfp_interrupt_timer_call(unsigned long _data)
-{
-	struct egisfp_interrupt_desc_t *fps_int = (struct egisfp_interrupt_desc_t *)_data;
-	struct egisfp_dev_t *egis_dev;
 
-	egis_dev = container_of(fps_int, struct egisfp_dev_t, fps_ints);
-	INFO_PRINT(" %s : interrupt count = %d \n", __func__, egis_dev->fps_ints.int_count);
-
-	if (egis_dev->fps_ints.int_count >= egis_dev->fps_ints.detect_threshold)
-	{
-		egis_dev->fps_ints.finger_on = 1;
-		INFO_PRINT(" %s : interrupt triggered \n", __func__);
-	}
-	else
-	{
-		INFO_PRINT(" %s : interrupt not triggered \n", __func__);
-	}
-	egis_dev->fps_ints.int_count = 0;
-	wake_up_interruptible(&interrupt_waitq);
-}
-#endif
 irqreturn_t fp_eint_func(int irq, void *dev_id)
 {
-	struct egisfp_dev_t *egis_dev = dev_id;
-	if (!egis_dev->fps_ints.int_count)
-		mod_timer(&egis_dev->fps_ints.timer, jiffies + msecs_to_jiffies(egis_dev->fps_ints.detect_period));
-	egis_dev->fps_ints.int_count++;
-	INFO_PRINT(" %s : fps_ints.int_count=%d \n", __func__, egis_dev->fps_ints.int_count);
-	pm_wakeup_event(&egis_dev->dd->dev, WAKE_HOLD_TIME);
+	struct egistec_data *egistec = dev_id;
+	if (!fps_ints.int_count)
+		mod_timer(&fps_ints.timer, jiffies + msecs_to_jiffies(fps_ints.detect_period));
+	fps_ints.int_count++;
+	DEBUG_PRINT("EGISTEC fp_eint_func  , fps_ints.int_count=%d\n", fps_ints.int_count);
+	pm_wakeup_event(&egistec->dd->dev, WAKE_HOLD_TIME);
 	return IRQ_HANDLED;
 }
 
 irqreturn_t fp_eint_func_ll(int irq, void *dev_id)
 {
-	struct egisfp_dev_t *egis_dev = dev_id;
-	INFO_PRINT(" %s \n", __func__);
-	egis_dev->fps_ints.finger_on = 1;
-	egisfp_interrupt_enable(egis_dev, 0);
+	struct egistec_data *egistec = dev_id;
+	DEBUG_PRINT("EGISTEC fp_eint_func_ll\n");
+	fps_ints.finger_on = 1;
+	egisfp_interrupt_enable(egistec, 0);
+	pm_wakeup_event(&egistec->dd->dev, WAKE_HOLD_TIME);
 	wake_up_interruptible(&interrupt_waitq);
-	pm_wakeup_event(&egis_dev->dd->dev, WAKE_HOLD_TIME);
 	return IRQ_RETVAL(IRQ_HANDLED);
 }
 
 /*
  *	FUNCTION NAME.
- *		egisfp_interrupt_init
+ *		Interrupt_Init
  *
  *	FUNCTIONAL DESCRIPTION.
  *		button initial routine
@@ -231,130 +335,78 @@ irqreturn_t fp_eint_func_ll(int irq, void *dev_id)
  *		Function Return int
  */
 
-int egisfp_interrupt_init(struct egisfp_dev_t *egis_dev, int int_mode, int detect_period, int detect_threshold)
+int Interrupt_Init(struct egistec_data *egistec, int int_mode, int detect_period, int detect_threshold)
 {
 
 	int err = 0;
-	INFO_PRINT(" %s :  mode = %d period = %d threshold = %d \n", __func__, int_mode, detect_period, detect_threshold);
-	INFO_PRINT(" %s :  request_irq_done = %d gpio_irq = %d  pin = %d \n", __func__, egis_dev->request_irq_done, egis_dev->gpio_irq, egis_dev->irqPin);
+	int status = 0;
+	DEBUG_PRINT("EGISTEC   %s mode = %d period = %d threshold = %d\n", __func__, int_mode, detect_period, detect_threshold);
+	DEBUG_PRINT("EGISTEC   %s request_irq_done = %d gpio_irq = %d  pin = %d  \n", __func__, egistec->request_irq_done, egistec->gpio_irq, egistec->irqPin);
 
-	egis_dev->fps_ints.detect_period = detect_period;
-	egis_dev->fps_ints.detect_threshold = detect_threshold;
-	egis_dev->fps_ints.int_count = 0;
-	egis_dev->fps_ints.finger_on = 0;
-	egis_dev->fps_ints.drdy_irq_abort = 0;
+	fps_ints.detect_period = detect_period;
+	fps_ints.detect_threshold = detect_threshold;
+	fps_ints.int_count = 0;
+	fps_ints.finger_on = 0;
+	fps_ints.drdy_irq_abort = 0;
 
-	if (egis_dev->request_irq_done == 0)
-	{
-		if (gpio_is_valid(egis_dev->irqPin))
-		{
-			egis_dev->gpio_irq = gpio_to_irq(egis_dev->irqPin);
-			INFO_PRINT(" %s : fp_irq number %d \n", __func__, egis_dev->gpio_irq);
+	if (egistec->request_irq_done == 0) {
+		if (gpio_is_valid(egistec->irqPin)) {
+			egistec->gpio_irq = gpio_to_irq(egistec->irqPin);
+			printk("EGISTEC fp_irq number %d\n", egistec->gpio_irq);
+		} else {
+			printk("irqPin is not valid  \n");
 		}
-		else
-		{
-			ERROR_PRINT(" %s : irqPin is not valid \n", __func__);
-			return -EIO;
-		}
-
-		if (egis_dev->gpio_irq < 0)
-		{
-			ERROR_PRINT(" %s : gpio_to_irq failed \n", __func__);
-			return -EIO;
-		}
-		INFO_PRINT(" %s : current flag : %d disable: %d enable: %d \n", __func__, egis_dev->fps_ints.drdy_irq_flag, DRDY_IRQ_DISABLE, DRDY_IRQ_ENABLE);
-		egis_dev->request_irq_done = 1;
-		egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_ENABLE;
-		if (int_mode == EDGE_TRIGGER_RISING)
-		{
-			INFO_PRINT(" %s : EDGE_TRIGGER_RISING \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_RISING, "fp_detect-eint", egis_dev);
-		}
-		else if (int_mode == EDGE_TRIGGER_FALLING)
-		{
-			INFO_PRINT(" %s : EDGE_TRIGGER_FALLING \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_FALLING, "fp_detect-eint", egis_dev);
-		}
-		else if (int_mode == LEVEL_TRIGGER_LOW)
-		{
-			INFO_PRINT(" %s : LEVEL_TRIGGER_LOW \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_LOW, "fp_detect-eint", egis_dev);
-		}
-		else if (int_mode == LEVEL_TRIGGER_HIGH)
-		{
-			INFO_PRINT(" %s : LEVEL_TRIGGER_HIGH \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_HIGH, "fp_detect-eint", egis_dev);
-		}
-		else
-		{
-			ERROR_PRINT(" %s : Invalid argument \n", __func__);
-			err = -EINVAL;
+		if (egistec->gpio_irq < 0) {
+			DEBUG_PRINT("EGISTEC %s gpio_to_irq failed\n", __func__);
+			status = egistec->gpio_irq;
+			goto done;
 		}
 
-		if (err)
-		{
-			egis_dev->request_irq_done = 0;
-			egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
-			ERROR_PRINT(" %s : request_irq failed return %d \n", __func__, err);
-			return err;
-		}
+		DEBUG_PRINT("[EGISTEC Interrupt_Init] flag current: %d disable: %d enable: %d\n",
+		fps_ints.drdy_irq_flag, DRDY_IRQ_DISABLE, DRDY_IRQ_ENABLE);
 
-		INFO_PRINT(" %s : request_irq return %d \n", __func__, err);
-		egis_dev->fps_ints.irq_mode = int_mode;
-	} 
-	else if (egis_dev->fps_ints.irq_mode != int_mode)
-	{
-
-		egisfp_interrupt_enable(egis_dev, 0);
-		free_irq(egis_dev->gpio_irq, egis_dev);
-		egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_ENABLE;
-		if (int_mode == EDGE_TRIGGER_RISING)
-		{
-			INFO_PRINT(" %s : EDGE_TRIGGER_RISING \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_RISING, "fp_detect-eint", egis_dev);
+		if (int_mode == EDGE_TRIGGER_RISING) {
+			DEBUG_PRINT("EGISTEC %s EDGE_TRIGGER_RISING\n", __func__);
+			err = request_irq(egistec->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_RISING, "fp_detect-eint", egistec);
+			if (err) {
+				pr_err("request_irq failed==========%s,%d\n", __func__, __LINE__);
+				}
+		} else if (int_mode == EDGE_TRIGGER_FALLING) {
+			DEBUG_PRINT("EGISTEC %s EDGE_TRIGGER_FALLING\n", __func__);
+			err = request_irq(egistec->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_FALLING, "fp_detect-eint", egistec);
+			if (err) {
+				pr_err("request_irq failed==========%s,%d\n", __func__, __LINE__);
+				}
+		} else if (int_mode == LEVEL_TRIGGER_LOW) {
+			DEBUG_PRINT("EGISTEC %s LEVEL_TRIGGER_LOW\n", __func__);
+			err = request_irq(egistec->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_LOW, "fp_detect-eint", egistec);
+			if (err) {
+				pr_err("request_irq failed==========%s,%d\n", __func__, __LINE__);
+				}
+		} else if (int_mode == LEVEL_TRIGGER_HIGH) {
+			DEBUG_PRINT("EGISTEC %s LEVEL_TRIGGER_HIGH\n", __func__);
+			err = request_irq(egistec->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_HIGH, "fp_detect-eint", egistec);
+			if (err) {
+				pr_err("request_irq failed==========%s,%d\n", __func__, __LINE__);
+				}
 		}
-		else if (int_mode == EDGE_TRIGGER_FALLING)
-		{
-			INFO_PRINT(" %s : EDGE_TRIGGER_FALLING \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func, IRQ_TYPE_EDGE_FALLING, "fp_detect-eint", egis_dev);
-		}
-		else if (int_mode == LEVEL_TRIGGER_LOW)
-		{
-			INFO_PRINT(" %s : LEVEL_TRIGGER_LOW \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_LOW, "fp_detect-eint", egis_dev);
-		}
-		else if (int_mode == LEVEL_TRIGGER_HIGH)
-		{
-			INFO_PRINT(" %s : LEVEL_TRIGGER_HIGH \n", __func__);
-			err = request_irq(egis_dev->gpio_irq, fp_eint_func_ll, IRQ_TYPE_LEVEL_HIGH, "fp_detect-eint", egis_dev);
-		}
-		else
-		{
-			ERROR_PRINT(" %s : Invalid argument \n", __func__);
-			err = -EINVAL;
-		}
-
-		if (err)
-		{
-			egis_dev->request_irq_done = 0;
-			egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
-			ERROR_PRINT(" %s : request_irq failed return %d \n", __func__, err);
-			return err;
-		}
-
-		INFO_PRINT(" %s : request_irq return %d \n", __func__, err);
-		egis_dev->fps_ints.irq_mode = int_mode;
+		DEBUG_PRINT("[EGISTEC Interrupt_Init]:gpio_to_irq return: %d\n", egistec->gpio_irq);
+		DEBUG_PRINT("[EGISTEC Interrupt_Init]:request_irq return: %d\n", err);
+		disable_irq_nosync(egistec->gpio_irq);
+		egistec->request_irq_done = 1;
 	}
+	DEBUG_PRINT("[EGISTEC Interrupt_Init] flag current: %d disable: %d enable: %d\n",
+	fps_ints.drdy_irq_flag, DRDY_IRQ_DISABLE, DRDY_IRQ_ENABLE);
+	DEBUG_PRINT("EGISTEC %s mode = %d enable irq \n", __func__, int_mode);
+	egisfp_interrupt_enable(egistec, 1);
 
-	INFO_PRINT(" %s : current flag : %d disable: %d enable: %d \n", __func__, egis_dev->fps_ints.drdy_irq_flag, DRDY_IRQ_DISABLE, DRDY_IRQ_ENABLE);
-	INFO_PRINT(" %s : enable irq with mode = %d \n", __func__, int_mode);
-	egisfp_interrupt_enable(egis_dev, 1);
-	return err;
+done:
+	return 0;
 }
 
 /*
  *	FUNCTION NAME.
- *		egisfp_interrupt_free
+ *		Interrupt_Free
  *
  *	FUNCTIONAL DESCRIPTION.
  *		free all interrupt resource
@@ -363,12 +415,12 @@ int egisfp_interrupt_init(struct egisfp_dev_t *egis_dev, int int_mode, int detec
  *		Function Return int
  */
 
-int egisfp_interrupt_free(struct egisfp_dev_t *egis_dev)
+int Interrupt_Free(struct egistec_data *egistec)
 {
-	DEBUG_PRINT(" %s \n", __func__);
-	egisfp_interrupt_enable(egis_dev, 0);
-	del_timer_sync(&egis_dev->fps_ints.timer);
-	egis_dev->fps_ints.finger_on = 0;
+	DEBUG_PRINT("EGISTEC %s\n", __func__);
+	egisfp_interrupt_enable(egistec, 0);
+	del_timer_sync(&fps_ints.timer);
+	fps_ints.finger_on = 0;
 	return 0;
 }
 
@@ -386,1031 +438,988 @@ int egisfp_interrupt_free(struct egisfp_dev_t *egis_dev)
  *		Function Return int
  */
 
-unsigned int egisfp_interrupt_poll(struct file *file, struct poll_table_struct *wait)
+unsigned int fps_interrupt_poll(
+struct file *file,
+struct poll_table_struct *wait)
 {
 	unsigned int mask = 0;
-	struct egisfp_dev_t *egis_dev;
-	egis_dev = file->private_data;
+	struct egistec_data *egistec;
+	egistec = file->private_data;
 	poll_wait(file, &interrupt_waitq, wait);
-	if (egis_dev->fps_ints.finger_on)
-	{
+	if (fps_ints.finger_on) {
 		mask |= POLLIN | POLLRDNORM;
+	} else if (fps_ints.drdy_irq_abort == 1) {
+		mask |= POLLFREE;
+		fps_ints.drdy_irq_abort = 0;
 	}
-	else if (egis_dev->fps_ints.drdy_irq_abort == 1)
-	{
-		mask |= 0x400 | POLLRDNORM;
-		egis_dev->fps_ints.drdy_irq_abort = 0;
-	}
+
 	return mask;
 }
 
-void egisfp_interrupt_abort(struct egisfp_dev_t *egis_dev)
+void fps_interrupt_abort(void)
 {
-	DEBUG_PRINT(" %s \n", __func__);
-	egis_dev->fps_ints.finger_on = 0;
-	egis_dev->fps_ints.drdy_irq_abort = 1;
+	DEBUG_PRINT("EGISTEC %s\n", __func__);
+	fps_ints.finger_on = 0;
+	fps_ints.drdy_irq_abort = 1;
 	wake_up_interruptible(&interrupt_waitq);
 }
 
 /*-------------------------------------------------------------------------*/
-
-static void send_navi_event(struct egisfp_dev_t *egis_dev, int nav_event)
+void egistec_reset(struct egistec_data *egistec)
 {
-	uint32_t input_event;
-
-	switch (nav_event)
-	{
-	case NAVI_EVENT_ON:
-		DEBUG_PRINT(" %s : finger down \n", __func__);
-		input_event = EGIS_NAV_INPUT_FINGER_DOWN;
-		break;
-	case NAVI_EVENT_OFF:
-		DEBUG_PRINT(" %s : finger up \n", __func__);
-		input_event = EGIS_NAV_INPUT_FINGER_UP;
-		break;
-	case NAVI_EVENT_UP:
-		DEBUG_PRINT(" %s : nav swip up \n", __func__);
-		input_event = EGIS_NAV_INPUT_UP;
-		break;
-	case NAVI_EVENT_DOWN:
-		DEBUG_PRINT(" %s : nav swip down \n", __func__);
-		input_event = EGIS_NAV_INPUT_DOWN;
-		break;
-	case NAVI_EVENT_LEFT:
-		DEBUG_PRINT(" %s : nav swip left \n", __func__);
-		input_event = EGIS_NAV_INPUT_LEFT;
-		break;
-	case NAVI_EVENT_RIGHT:
-		DEBUG_PRINT(" %s : nav swip right \n", __func__);
-		input_event = EGIS_NAV_INPUT_RIGHT;
-		break;
-	case NAVI_EVENT_CLICK:
-		DEBUG_PRINT(" %s : nav finger click \n", __func__);
-		input_event = EGIS_NAV_INPUT_CLICK;
-		break;
-	case NAVI_EVENT_DOUBLE_CLICK:
-		DEBUG_PRINT(" %s : nav finger double click \n", __func__);
-		input_event = EGIS_NAV_INPUT_DOUBLE_CLICK;
-		break;
-	case NAVI_EVENT_LONG_PRESS:
-		DEBUG_PRINT(" %s : nav finger long press \n", __func__);
-		input_event = EGIS_NAV_INPUT_LONG_PRESS;
-		break;
-	default:
-		DEBUG_PRINT(" %s : unknown nav event: %d \n", __func__, nav_event);
-		input_event = 0;
-		break;
-	}
-
-	if (input_event)
-	{
-		input_report_key(egis_dev->input_dev, input_event, 1);
-		input_sync(egis_dev->input_dev);
-		input_report_key(egis_dev->input_dev, input_event, 0);
-		input_sync(egis_dev->input_dev);
-	}
-}
-
-int do_egisfp_reset(struct egisfp_dev_t *egis_dev)
-{
-	int ret = 0;
-	ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_low);
-	mdelay(Rst_off_delay);
-	ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_high);
-	mdelay(Rst_on_delay);
-	if (ret)
-		ERROR_PRINT(" %s : failed ret = %d \n", __func__, ret);
-	else
-		DEBUG_PRINT(" %s : reset_pin = %d \n", __func__, gpio_get_value(egis_dev->rstPin));
-	return ret;
-}
-
-int egisfp_set_screen_onoff(int on)
-{
-	DEBUG_PRINT(" %s \n", __func__);
-
-	if (!g_data)
-		return -ENXIO;
-
-	g_data->screen_onoff = on;
-
-	DEBUG_PRINT(" %s screen_onoff %d \n", __func__, g_data->screen_onoff);
-
-	return 0;
-}
-EXPORT_SYMBOL(egisfp_set_screen_onoff);
-
-static int egisfp_vreg_setup(struct egisfp_dev_t *egis_dev, bool enable, bool enable_3_8V) {
-	int ret = 0;
-	if (enable) {
-		DEBUG_PRINT(" %s : original voltage = %d \n", __func__, regulator_get_voltage(egis_dev->vcc));
-		if (enable_3_8V) {
-			DEBUG_PRINT(" %s : enable_3_8V \n", __func__);
-			ret = regulator_set_voltage(egis_dev->vcc, egis_dev->regulator_voltage_max,  egis_dev->max_voltage);
-		} else {
-			DEBUG_PRINT(" %s : enable_3_35V \n", __func__);
-			ret = regulator_set_voltage(egis_dev->vcc, egis_dev->regulator_voltage_min,  egis_dev->max_voltage);
+	int i = 0;
+	bool match = false;
+	for (i = 0; i < 2; i++) {
+		if( strcmp(EGIS_MODEL_NAME, reset_config[i].name) == 0) {
+			pr_info("[egis] apply reset_config[%d].name = %s\n", i, reset_config[i].name);
+			match = true;
+			pinctrl_select_state(egistec->pinctrl, egistec->reset_low);
+			mdelay(reset_config[i].low1);
+			pinctrl_select_state(egistec->pinctrl, egistec->reset_high);
+			mdelay(reset_config[i].hi1);
+			pinctrl_select_state(egistec->pinctrl, egistec->reset_low);
+			mdelay(reset_config[i].low2);
+			pinctrl_select_state(egistec->pinctrl, egistec->reset_high);
+			mdelay(reset_config[i].hi2);
+			break;
 		}
-		DEBUG_PRINT(" %s : modified voltage = %d, ret = %d \n", __func__, regulator_get_voltage(egis_dev->vcc), ret);
-		ret |= regulator_enable(egis_dev->vcc);
-		DEBUG_PRINT(" %s : regulator enable, ret = %d \n", __func__, ret);
+
+	}
+
+	if (!match) {
+		DEBUG_PRINT(" %s\n", __func__);
+		pinctrl_select_state(egistec->pinctrl, egistec->reset_low);
+		mdelay(ET6XX_Rst_on_delay);
+		pinctrl_select_state(egistec->pinctrl, egistec->reset_high);
+		mdelay(ET6XX_Rst_on_delay);
+	}
+
+}
+
+static int vreg_setup(struct egistec_data *egistec, bool enable, bool enable_3_8V) {
+	int ret = 0;
+
+	if (enable) {
+		DEBUG_PRINT("[egis] %s original voltage = %d \n", __func__, regulator_get_voltage(egistec->vcc));
+
+		if (enable_3_8V) {
+			DEBUG_PRINT("[egis] %s enable_3_8V ! \n", __func__);
+			ret = regulator_set_voltage(egistec->vcc, egistec->regulator_max_voltage,  egistec->max_voltage);
+		} else {
+			DEBUG_PRINT("[egis] %s enable_3_35V ! \n", __func__);
+			ret = regulator_set_voltage(egistec->vcc, egistec->regulator_min_voltage,  egistec->max_voltage);
+		}
+		DEBUG_PRINT("[egis] %s modified voltage = %d \n", __func__, regulator_get_voltage(egistec->vcc));
+		if (egistec->power_enable) {
+			DEBUG_PRINT("[egis] %s already enable ! \n", __func__);
+			return 0;
+		}
+		regulator_enable(egistec->vcc);
+		DEBUG_PRINT("[egis] %s regulator enable ! \n", __func__);
+		egistec->power_enable = true;
+
 	} else {
-		ret = regulator_set_voltage(egis_dev->vcc, egis_dev->regulator_voltage_min,  egis_dev->max_voltage);
-		ret |= regulator_disable(egis_dev->vcc);
-		DEBUG_PRINT(" %s : regulator disable, ret = %d \n", __func__, ret);
+
+		ret = regulator_set_voltage(egistec->vcc, egistec->regulator_min_voltage,  egistec->max_voltage);
+
+		if (!egistec->power_enable) {
+			DEBUG_PRINT("[egis] %s already disable ! \n", __func__);
+			return 0;
+		}
+		regulator_disable(egistec->vcc);
+		DEBUG_PRINT("[egis] %s regulator disable ! \n", __func__);
+		egistec->power_enable = false;
+
 	}
 	return ret;
 }
 
-int do_egisfp_power_onoff(struct egisfp_dev_t *egis_dev, struct egisfp_ioctl_cmd_t *ioctl_data)
+#ifdef PLATFORM_SPI
+static ssize_t egis_spi_sync(struct egistec_data *spidev, struct spi_message *message) {
+	int status;
+	struct spi_device *spi;
+
+	spi = spidev->dd;
+
+	if (spi == NULL)
+		status = -ESHUTDOWN;
+	else
+		status = spi_sync(spi, message);
+
+	pr_info("%s status = %d\n", __func__, status);
+
+	if (status == 0)
+		status = message->actual_length;
+
+	return status;
+}
+
+static inline ssize_t egis_spi_sync_write(struct egistec_data *spidev, size_t len) {
+	struct spi_transfer	t = {
+			.tx_buf		= spidev->tx_buffer,
+			.len			= len,
+			.speed_hz	= SPI_DEFAULT_SPEED,
+		};
+	struct spi_message	m;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	return egis_spi_sync(spidev, &m);
+}
+
+static inline ssize_t egis_spi_sync_read(struct egistec_data *spidev, size_t len)
 {
+	struct spi_transfer	t = {
+			.tx_buf		= spidev->rx_buffer,
+			.rx_buf		= spidev->rx_buffer,
+			.len			= len,
+			.speed_hz	= SPI_DEFAULT_SPEED,
+		};
+	struct spi_message	m;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	return egis_spi_sync(spidev, &m);
+}
 
 
+ssize_t egistec_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+	struct egistec_data	*spidev;
+	ssize_t status = 0;
+	char *tempbuf;
+	unsigned long		missing;
 
-	
-	int ret = 0;
-	//uint32_t power_onoff = ioctl_data->int_mode;	// RBS
-	uint32_t power_onoff = ioctl_data->power_on;	// BIX
+	spidev = filp->private_data;
 
-	if (!egis_dev->ctrl_power)
-	{
-		INFO_PRINT(" %s : power can not control by driver \n", __func__);
-		return ret;
+	tempbuf = kzalloc(count, GFP_KERNEL);
+	if (!tempbuf)
+		return 0;
+	mutex_lock(&spidev->buf_lock);
+	spidev->rx_buffer = tempbuf;
+	missing = copy_from_user(tempbuf, buf, count);
+	pr_info("%s spi read count = %d\n", __func__, count);
+	status = egis_spi_sync_read(spidev, count);
+	if (status > 0) {
+
+		pr_info("%s get values = %x %x %x %x\n", __func__, *(spidev->rx_buffer), *(spidev->rx_buffer + 1), \
+			*(spidev->rx_buffer + 2), *(spidev->rx_buffer + 3));
+
+		missing = copy_to_user(buf, spidev->rx_buffer, count);
+		if (missing == status)
+			status = -EFAULT;
+		else
+			status = status - missing;
 	}
+	kfree(tempbuf);
+	mutex_unlock(&spidev->buf_lock);
+	return status;
+}
 
-	DEBUG_PRINT(" %s : power_onoff = %d \n", __func__, power_onoff);
+ssize_t egistec_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
+	struct egistec_data	*spidev;
+	ssize_t			status = 0;
+	char *tempbuf;
+	unsigned long		missing;
 
-	if (egis_dev->power_enable == power_onoff)
-	{
-		INFO_PRINT(" %s : duplicate set power on/off \n", __func__);
-		return ret;
-	}
+	/* chipselect only toggles at start or end of operation */
+	tempbuf = kzalloc(count, GFP_KERNEL);
+	spidev = filp->private_data;
+	spidev->tx_buffer = tempbuf;
+	if (!spidev->tx_buffer)
+		return 0;
+	mutex_lock(&spidev->buf_lock);
+	missing = copy_from_user(spidev->tx_buffer, buf, count);
+	if (missing == 0)
+		status = egis_spi_sync_write(spidev, count);
+	else
+		status = -EFAULT;
 
-	switch(power_onoff)
-	{
+	kfree(spidev->tx_buffer);
+	mutex_unlock(&spidev->buf_lock);
+	return status;
+}
+#endif
+static void egis_power_onoff(struct egistec_data *egis, int power_onoff)
+{
+	DEBUG_PRINT("[egis] %s   power_onoff = %d \n", __func__, power_onoff);
+
+	switch(power_onoff) {
 		case 1:
 		{
-			if (egis_dev->ext_ldo_source)
-				ret |= egisfp_vreg_setup(egis_dev, true, false);
-			if (egis_dev->pwr_by_gpio)
-			{
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->vcc_high);
-				msleep(Rst_on_delay);
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_high);
-			}
+			if(egis->ext_ldo_source)
+				vreg_setup(egis, true, false);
+			if (egis->pwr_by_gpio)
+				pinctrl_select_state(egis->pinctrl, egis->vcc_high);
 			else
-				ret |= regulator_enable(egis_dev->vcc);
+				vreg_setup(egis, true, false);
 
-			if (ret)
-				goto do_egisfp_power_onoff_failed;
-
-			msleep(Tpwr_on_delay);
-			egis_dev->power_enable = power_onoff;
+			pinctrl_select_state(egis->pinctrl, egis->irq_active);
+			msleep(ET6XX_Tpwr_on_delay);
 			break;
 		}
 		case 2:
 		{
-			if (egis_dev->ext_ldo_source)
-				ret |= egisfp_vreg_setup(egis_dev, true, true);
-			if (egis_dev->pwr_by_gpio)
-			{
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->vcc_high);
-				msleep(Rst_on_delay);
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_high);
-			}
+			if(egis->ext_ldo_source)
+				vreg_setup(egis, true, true);
+			if (egis->pwr_by_gpio)
+				pinctrl_select_state(egis->pinctrl, egis->vcc_high);
 			else
-				ret |= regulator_enable(egis_dev->vcc);
-			if (ret)
-				goto do_egisfp_power_onoff_failed;
-			msleep(Tpwr_on_delay);
-			egis_dev->power_enable = power_onoff;
+				vreg_setup(egis, true, false);
+
+			pinctrl_select_state(egis->pinctrl, egis->irq_active);
+			msleep(ET6XX_Tpwr_on_delay);
 			break;
 		}
 		default:
 		{
-			if (egis_dev->pwr_by_gpio)
-			{
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->vcc_low);
-				msleep(Rst_off_delay);
-				ret |= pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_low);
-			}
+			if (egis->pwr_by_gpio)
+				pinctrl_select_state(egis->pinctrl, egis->vcc_low);
 			else
-				ret |= regulator_disable(egis_dev->vcc);
-			
+				vreg_setup(egis, false, false);
+			if(egis->ext_ldo_source)
+				vreg_setup(egis, false, false);
 
-			if (egis_dev->ext_ldo_source)
-				ret |= egisfp_vreg_setup(egis_dev, false, false);
-			if (ret)
-				goto do_egisfp_power_onoff_failed;
-
-			msleep(Tpwr_off_delay);
-			egis_dev->power_enable = power_onoff;
+			pinctrl_select_state(egis->pinctrl, egis->irq_low);
+			msleep(ET6XX_Tpwr_off_delay);
 			break;
 		}
 	}
-
-	if (egis_dev->pwr_by_gpio)
-	{
-		DEBUG_PRINT(" %s : power_pin value = %d \n", __func__, gpio_get_value(egis_dev->vcc_33v_Pin));
-	}
+	if (egis->pwr_by_gpio)
+		DEBUG_PRINT("[egis] %s   power_pin value = %d \n", __func__, gpio_get_value(egis->vcc_33v_Pin));
 	else
-		DEBUG_PRINT(" %s : regulator enable = %d output voltage %d \n", __func__, regulator_is_enabled(egis_dev->vcc), regulator_get_voltage(egis_dev->vcc));
-
-	return ret;
-
-do_egisfp_power_onoff_failed:
-	ERROR_PRINT(" %s : failed ret = %d \n", __func__, ret);
-	return ret;
+		DEBUG_PRINT("[egis] %s   regulator enable = %d \n", __func__, regulator_is_enabled(egis->vcc));
 }
-int do_egisfp_reset_set(struct egisfp_dev_t *egis_dev, int reset_high_low)
+static void egis_reset_high_low(struct egistec_data *egis, int reset_high_low)
 {
-	int ret = 0;
-	DEBUG_PRINT(" %s : reset_high_low = %d \n", __func__, reset_high_low);
-
-	if (reset_high_low)
-	{
-		ret = pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_high);
-	}
-	else
-	{
-		ret = pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_low);
+	pr_info("[egis] %s   reset_high_low = %d \n", __func__, reset_high_low);
+	if (reset_high_low) {
+		pinctrl_select_state(egis->pinctrl, egis->reset_high);
+	msleep(ET6XX_Rst_on_delay);
+	} else {
+		pinctrl_select_state(egis->pinctrl, egis->reset_low);
+	msleep(ET6XX_Rst_on_delay);
 	}
 
-	if (ret)
-		ERROR_PRINT(" %s : failed ret = %d \n", __func__, ret);
-	else
-		DEBUG_PRINT(" %s : reset_pin value = %d \n", __func__, gpio_get_value(egis_dev->rstPin));
-	return ret;
+	DEBUG_PRINT("[egis] %s   reset_pin value = %d \n", __func__, gpio_get_value(egis->rstPin));
 }
 
-static void egis_get_io_stus(struct egisfp_dev_t *egis_dev)
+#if defined(MTK_PLATFORM) || defined(SAMSUNG_PLATFORM)
+int egistec_spi_pin(struct egistec_data *egistec, bool en)
 {
-	INFO_PRINT(" %s \n", __func__);
-	if (egis_dev->ctrl_power)
-	{
-		if (egis_dev->pwr_by_gpio)
-			INFO_PRINT(" %s : power_pin value = %d \n", __func__, gpio_get_value(egis_dev->vcc_33v_Pin));
-		else
-			INFO_PRINT(" %s : regulator vcc enable = %d \n", __func__, regulator_is_enabled(egis_dev->vcc));
+	pr_info("%s spi_pin status = %d\n", __func__, en);
+	if (en) {
+		pinctrl_select_state(egistec->pinctrl, egistec->spi_active);
+
+	} else {
+		pinctrl_select_state(egistec->pinctrl, egistec->spi_default);
+
 	}
-
-	INFO_PRINT(" %s : reset_pin value = %d irq_pin value = %d \n", __func__, gpio_get_value(egis_dev->rstPin), gpio_get_value(egis_dev->irqPin));
+	return 0;
 }
+#endif
 
-
-long egisfp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+long egistec_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+
 	int retval = 0;
-	struct egisfp_dev_t *egis_dev = NULL;
-	struct egisfp_ioctl_cmd_t data = {0};
+	struct egistec_data *egistec;
+	struct ioctl_cmd data;
+	int status = 0;
+	memset(&data, 0, sizeof(data));
+	printk(" %s  cmd = 0x%X \n", __func__, cmd);
+	egistec = filp->private_data;
 
-	INFO_PRINT(" %s : cmd = 0x%X \n", __func__, cmd);
-	egis_dev = (struct egisfp_dev_t *)filp->private_data;
-
-	if (!egis_dev->pars_dtsi_done)
-	{
-		ERROR_PRINT(" %s : egis_dev is NULL \n", __func__);
-		return -ENODEV;
+	if (!egistec->egistec_platformInit_done)
+	/* platform init */
+		status = egistec_platformInit(egistec);
+	if (status != 0) {
+		pr_err(" %s platforminit failed\n", __func__);
 	}
 
-	if (egisfp_check_ioctl_permission(egis_dev, cmd))
-		return -EACCES;
-
-	switch (cmd)
-	{
-	case FP_GET_RESOURCE:
-		DEBUG_PRINT(" %s : FP_GET_RESOURCE \n", __func__);
-		if (egisfp_platforminit(egis_dev))
-			retval = -EIO;
-		break;
-	case FP_FREE_RESOURCE:
-		DEBUG_PRINT(" %s : FP_FREE_RESOURCE \n", __func__);
-		egisfp_platformfree(egis_dev);
-		break;
-	case FP_SET_SPI_CLOCK:
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
-			return -EFAULT;
-		}
-		egis_dev->clk_speed = data.int_mode * 1000000;
-		DEBUG_PRINT(" %s : FP_SET_SPI_CLOCK %d \n", __func__, egis_dev->clk_speed);
-		break;
+	switch (cmd) {
 	case INT_TRIGGER_INIT:
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
+		if (copy_from_user(&data, (int __user *)arg, sizeof(data))) {
 			return -EFAULT;
 		}
-		retval = egisfp_interrupt_init(egis_dev, data.int_mode, data.detect_period, data.detect_threshold);
-		DEBUG_PRINT(" %s : INT_TRIGGER_INIT %x \n", __func__, retval);
+		DEBUG_PRINT("EGISTEC fp_ioctl >>> fp Trigger function init\n");
+		retval = Interrupt_Init(egistec, data.int_mode, data.detect_period, data.detect_threshold);
+		DEBUG_PRINT("EGISTEC fp_ioctl trigger init = %x\n", retval);
 		break;
 	case FP_SENSOR_RESET:
-		DEBUG_PRINT(" %s : FP_SENSOR_RESET \n", __func__);
-		do_egisfp_reset(egis_dev);
+			DEBUG_PRINT("EGISTEC fp_ioctl ioc->opcode == FP_SENSOR_RESET \n");
+			egistec_reset(egistec);
 		break;
 	case FP_POWER_ONOFF:
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
+		if (copy_from_user(&data, (int __user *)arg, sizeof(data))) {
 			return -EFAULT;
 		}
-		DEBUG_PRINT(" %s : FP_POWER_ONOFF \n", __func__);
-		retval = do_egisfp_power_onoff(egis_dev, &data);
+		egis_power_onoff(egistec, data.int_mode);  // Use data.int_mode as power setting. 1 = on, 0 = off.
+		DEBUG_PRINT("[egis] %s: egis_power_onoff = %d\n", __func__, data.int_mode);
 		break;
 	case FP_RESET_SET:
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
+		if (copy_from_user(&data, (int __user *)arg, sizeof(data))) {
 			return -EFAULT;
 		}
-		DEBUG_PRINT(" %s : FP_RESET_SET \n", __func__);
-		retval = do_egisfp_reset_set(egis_dev, data.int_mode); // Use data.int_mode as reset setting. 1 = on, 0 = off.
+		egis_reset_high_low(egistec, data.int_mode);  // Use data.int_mode as reset setting. 1 = on, 0 = off.
+		DEBUG_PRINT("[egis] %s: egis_reset_high_low = %d\n", __func__, data.int_mode);
 		break;
-	case FP_WAKELOCK_ENABLE:
-		DEBUG_PRINT(" %s : FP_WAKELOCK_ENABLE \n", __func__);
-		pm_stay_awake(&egis_dev->dd->dev);
+	case FP_WAKELOCK_ENABLE: //0X08
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_WAKELOCK_ENABLE  \n");
+			pm_stay_awake(&egistec->dd->dev);
 		break;
-	case FP_WAKELOCK_DISABLE:
-		DEBUG_PRINT(" %s : FP_WAKELOCK_DISABLE \n", __func__);
-		pm_relax(&egis_dev->dd->dev);
+	case FP_WAKELOCK_DISABLE: //0X09
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_WAKELOCK_DISABLE  \n");
+			pm_relax(&egistec->dd->dev);
 		break;
-	case GET_IO_STUS:
-		DEBUG_PRINT(" %s : GET_IO_STUS \n", __func__);
-		egis_get_io_stus(egis_dev);
+#if defined(MTK_PLATFORM) || defined(SAMSUNG_PLATFORM)
+	case FP_SPIPIN_SETTING:
+		egistec_spi_pin(egistec, 1);
 		break;
-	case SEND_NAVI_EVENT:
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
-			return -EFAULT;
-		}
-		DEBUG_PRINT(" %s : SEND_NAVI_EVENT \n", __func__);
-		send_navi_event(egis_dev, data.int_mode);
+	case FP_SPIPIN_PULLLOW:
+		egistec_spi_pin(egistec, 0);
 		break;
+#endif
 	case INT_TRIGGER_CLOSE:
-		retval = egisfp_interrupt_free(egis_dev);
-		DEBUG_PRINT(" %s : INT_TRIGGER_CLOSE %d  \n", __func__, retval);
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< fp Trigger function close\n");
+			retval = Interrupt_Free(egistec);
+			DEBUG_PRINT("EGISTEC fp_ioctl trigger close = %x\n", retval);
 		break;
 	case INT_TRIGGER_ABORT:
-		DEBUG_PRINT(" %s : INT_TRIGGER_ABORT \n", __func__);
-		egisfp_interrupt_abort(egis_dev);
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< fp Trigger function close\n");
+			fps_interrupt_abort();
 		break;
 	case FP_FREE_GPIO:
-		DEBUG_PRINT(" %s : FP_FREE_GPIO \n", __func__);
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_FREE_GPIO  \n");
+			//egistec_platformFree(egistec);
 		break;
 	case FP_WAKELOCK_TIMEOUT_ENABLE: //0Xb1
-		if (copy_from_user(&data, (int __user *)arg, sizeof(data)))
-		{
+		if (copy_from_user(&data, (int __user *)arg, sizeof(data))) {
 			data.int_mode = WAKE_HOLD_TIME;
 		}
 		if (data.int_mode == 0)
 			data.int_mode = WAKE_HOLD_TIME;
 
-		DEBUG_PRINT(" %s : FP_WAKELOCK_TIMEOUT_ENABLE %d ms \n", __func__, data.int_mode);
-		pm_wakeup_event(&egis_dev->dd->dev, data.int_mode);
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_WAKELOCK_TIMEOUT_ENABLE DEVICE set %d ms \n", data.int_mode);
+			pm_wakeup_event(&egistec->dd->dev, data.int_mode);
 		break;
 	case FP_WAKELOCK_TIMEOUT_DISABLE: //0Xb2
-		DEBUG_PRINT(" %s : FP_WAKELOCK_TIMEOUT_DISABLE \n", __func__);
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_WAKELOCK_TIMEOUT_DISABLE  \n");
 		break;
+#if defined(MTK_PLATFORM) || defined(SAMSUNG_PLATFORM)
+	case FP_SPICLK_ENABLE:
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_SPICLK_ENABLE  \n");
+			spi_clk_enable(egistec, 1);
+		break;
+	case FP_SPICLK_DISABLE:
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< FP_SPICLK_DISABLE  \n");
+			spi_clk_enable(egistec, 0);
+		break;
+#endif
 	case DELETE_DEVICE_NODE:
-		DEBUG_PRINT(" %s : DELETE_DEVICE_NODE \n", __func__);
-		//delete_device_node();
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< DELETE_DEVICE_NODE  \n");
 		break;
 	case GET_SCREEN_ONOFF:
-		DEBUG_PRINT(" %s : GET_SCREEN_ONOFF \n", __func__);
-		data.int_mode = egis_dev->screen_onoff;
-		if (copy_to_user((int __user *)arg, &data, sizeof(data)))
-		{
+			DEBUG_PRINT("EGISTEC fp_ioctl <<< GET_SCREEN_ONOFF  \n");
+			data.int_mode = g_screen_onoff;
+		if (copy_to_user((int __user *)arg, &data, sizeof(data))) {
 			return -EFAULT;
 		}
 		break;
 	default:
-		retval = 0;
-		break;
+		retval = -ENOTTY;
+	break;
 	}
-	DEBUG_PRINT(" %s done \n", __func__);
+	DEBUG_PRINT(" %s done  \n", __func__);
 	return retval;
 }
 
 #ifdef CONFIG_COMPAT
-long egisfp_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+long egistec_compat_ioctl(struct file *filp, unsigned int cmd, 	unsigned long arg)
 {
-	return egisfp_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+	return egistec_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
 }
 #else
-#define egisfp_compat_ioctl NULL
+#define egistec_compat_ioctl NULL
 #endif /* CONFIG_COMPAT */
 
-int egisfp_open(struct inode *inode, struct file *filp)
+int egistec_open(struct inode *inode, struct file *filp)
 {
-	struct egisfp_dev_t *egis_dev = NULL;
+	struct egistec_data *egistec = g_data;
 	int status = -ENXIO;
-	DEBUG_PRINT(" %s \n", __func__);
-
+	DEBUG_PRINT("%s\n", __func__);
 	mutex_lock(&device_list_lock);
-	list_for_each_entry(egis_dev, &device_list, device_entry)
-	{
-		if (egis_dev->devt == inode->i_rdev)
-		{
+	list_for_each_entry(egistec, &device_list, device_entry) {
+		if (egistec->devt == inode->i_rdev) {
 			status = 0;
 			break;
 		}
 	}
-     DEBUG_PRINT(" %s  %d \n", __func__,__LINE__);
-	if (status == 0)
-	{
-			 DEBUG_PRINT(" %s  %d \n", __func__,__LINE__);
-		/* device tree call */
-		if (egis_dev->dd->dev.of_node && !egis_dev->pars_dtsi_done)
-		{
-			 DEBUG_PRINT(" %s  %d \n", __func__,__LINE__);
-			status = egisfp_parse_dt(egis_dev);
-		}
 
-		if (!status)
-		{
-			egis_dev->pars_dtsi_done = 1;
-			egis_dev->users++;
-			filp->private_data = egis_dev;
+	if (status == 0) {
+			egistec->users++;
+			filp->private_data = egistec;
 			nonseekable_open(inode, filp);
-			INFO_PRINT(" %s : open ioctl user count = %d \n", __func__, egis_dev->users);
-		}
-		else
-		{
-			ERROR_PRINT(" %s : egisfp_parse_dt fail, status = %d \n", __func__, status);
-		}
-	}
-	else
-	{
-		ERROR_PRINT(" %s : nothing for minor %d \n", __func__, iminor(inode));
+			pr_info("[%s] open ioctl user count = %d \n", __func__, egistec->users);
+			status = egistec_platformInit(egistec);
+			if (status)
+				pr_err("[%s] egistec_platformInit fail, status = %d \n", __func__, status);
+
+	} else {
+		pr_err("%s nothing for minor %d\n", __func__, iminor(inode));
 	}
 	mutex_unlock(&device_list_lock);
 	return status;
 }
 
-int egisfp_release(struct inode *inode, struct file *filp)
+int egistec_release(struct inode *inode, struct file *filp)
 {
-	struct egisfp_dev_t *egis_dev;
-	DEBUG_PRINT(" %s \n", __func__);
+	struct egistec_data *egistec;
+	DEBUG_PRINT("%s\n", __func__);
 	mutex_lock(&device_list_lock);
-	egis_dev = filp->private_data;
+	egistec = filp->private_data;
 	filp->private_data = NULL;
 	/* last close? */
-	egis_dev->users--;
-	if (egis_dev->users == 0)
-	{
-		INFO_PRINT(" %s : egis_dev->users == %d \n", __func__, egis_dev->users);
-		egisfp_platformfree(egis_dev);
+	egistec->users--;
+	if (egistec->users == 0) {
+		DEBUG_PRINT("%s egistec->users == %d\n", __func__, egistec->users);
+		egistec_platformFree(egistec);
 	}
 	mutex_unlock(&device_list_lock);
 	return 0;
 }
-int egisfp_platformfree(struct egisfp_dev_t *egis_dev)
+int egistec_platformFree(struct egistec_data *egistec)
 {
 	int status = 0;
-	struct egisfp_ioctl_cmd_t ioctl_data = {0};
-	DEBUG_PRINT(" %s : enter \n", __func__);
-	if (egis_dev->platforminit_done != 1)
+	DEBUG_PRINT("%s\n", __func__);
+	if (egistec->egistec_platformInit_done != 1)
 		return status;
-	if (egis_dev != NULL)
-	{
-		if (egis_dev->request_irq_done == 1)
-		{
-			egisfp_interrupt_enable(egis_dev, 0);
-			free_irq(egis_dev->gpio_irq, egis_dev);
-			egis_dev->request_irq_done = 0;
+	if (egistec != NULL) {
+		if (egistec->request_irq_done == 1) {
+			egisfp_interrupt_enable(egistec, 0);
+			free_irq(egistec->gpio_irq, egistec);
+			egistec->request_irq_done = 0;
 		}
-		status = do_egisfp_reset_set(egis_dev, 0);
-
-		if (egis_dev->power_enable && egis_dev->ctrl_power)
-			status = do_egisfp_power_onoff(egis_dev, &ioctl_data);
-
-		gpio_free(egis_dev->irqPin);
-		gpio_free(egis_dev->rstPin);
-		if (egis_dev->pwr_by_gpio)
-		{
-			gpio_free(egis_dev->vcc_33v_Pin);
-		}
-		if (egis_dev->vcc)
-		{
-			DEBUG_PRINT(" %s : devm_regulator_put \n", __func__);
-			devm_regulator_put(egis_dev->vcc);
-			egis_dev->vcc = NULL;
-		}
-
-
-		if (egis_dev->pinctrl)
-		{
-			DEBUG_PRINT(" %s : devm_pinctrl_put \n", __func__);
-			devm_pinctrl_put(egis_dev->pinctrl);
-			egis_dev->pinctrl = NULL;
-		}
+		gpio_free(egistec->irqPin);
+		gpio_free(egistec->rstPin);
+		if (egistec->pwr_by_gpio)
+			gpio_free(egistec->vcc_33v_Pin);
 	}
-	egis_dev->platforminit_done = 0;
-	DEBUG_PRINT(" %s : successful status = %d \n", __func__, status);
+	egistec->egistec_platformInit_done = 0;
+	DEBUG_PRINT("%s successful status=%d\n", __func__, status);
 	return status;
 }
 
-int egisfp_platforminit(struct egisfp_dev_t *egis_dev)
+int egistec_platformInit(struct egistec_data *egistec)
 {
-	int status;
-	INFO_PRINT(" %s : Version %s \n", __func__, DRIVER_VERSION);
-	if (egis_dev != NULL)
-	{
-		if (!egis_dev->platforminit_done)
-		{
-			if (egis_dev->ctrl_power)
-			{
-				if (egis_dev->pwr_by_gpio)
-				{
-					/* initial 33V power pin */
-					status = gpio_request(egis_dev->vcc_33v_Pin, "egis_dev-33v-gpio");
-					if (status < 0)
-					{
-						ERROR_PRINT(" %s : gpio_requset vcc_33v_Pin pin failed \n", __func__);
-						goto egisfp_power_request_fail;
-					}
-					status = gpio_direction_output(egis_dev->vcc_33v_Pin, 0);
-				}
-				else
-				{
-					egis_dev->vcc = devm_regulator_get(&egis_dev->dd->dev, "vcc_fp");
-					if (IS_ERR(egis_dev->vcc))
-					{
-						status = PTR_ERR(egis_dev->vcc);
-						ERROR_PRINT(" %s : get vcc regulator failed %d \n", __func__, status);
-						goto egisfp_power_request_fail;
-					}
+	int status = 0;
+	pr_info("%s\n", __func__);
+	if (egistec != NULL) {
+		if (!egistec->egistec_platformInit_done) {
 
-					if (regulator_count_voltages(egis_dev->vcc) > 0)
-					{
-						status = regulator_set_voltage(egis_dev->vcc, egis_dev->regulator_voltage_min, egis_dev->regulator_voltage_max);
-						if (status)
-						{
-							ERROR_PRINT(" %s : set vcc regulator voltage failed %d \n", __func__, status);
-							goto egisfp_power_setup_fail;
-						}
+			if (egistec->pwr_by_gpio) {
+				/* initial 33V power pin */
+				status = gpio_request(egistec->vcc_33v_Pin, "egistec-33v-gpio");
+				if (status < 0) {
+					pr_err("%s gpio_requset egistec-33v-gpio failed\n", __func__);
+					gpio_free(egistec->vcc_33v_Pin);
+					return status;
+				}
+				pinctrl_select_state(egistec->pinctrl, egistec->vcc_low);
 
-						status = regulator_set_load(egis_dev->vcc, egis_dev->regulator_current);
-						if (status)
-						{
-							ERROR_PRINT(" %s : set vcc regulator current failed %d \n", __func__, status);
-							goto egisfp_power_setup_fail;
-						}
-					}
-				}
-				if (egis_dev->ext_ldo_source)
-				{
-					egis_dev->vcc = devm_regulator_get(&egis_dev->dd->dev, "vcc_fp");
-					if (IS_ERR(egis_dev->vcc))
-					{
-						status = PTR_ERR(egis_dev->vcc);
-						ERROR_PRINT(" %s : get vcc regulator failed %d \n", __func__, status);
-						goto egisfp_power_request_fail;
-					}
-					if (regulator_count_voltages(egis_dev->vcc) > 0)
-					{
-						status = regulator_set_voltage(egis_dev->vcc, egis_dev->regulator_voltage_min, egis_dev->regulator_voltage_max);
-						if (status)
-						{
-							ERROR_PRINT(" %s : set vcc regulator voltage failed %d \n", __func__, status);
-							goto egisfp_power_setup_fail;
-						}
-						status = regulator_set_load(egis_dev->vcc, egis_dev->regulator_current);
-						if (status)
-						{
-							ERROR_PRINT(" %s : set vcc regulator current failed %d \n", __func__, status);
-							goto egisfp_power_setup_fail;
-						}
-					}
-				}
 			}
 
 			/* Initial Reset Pin */
-			status = gpio_request(egis_dev->rstPin, "egis_dev-reset-gpio");
-			if (status < 0)
-			{
-				ERROR_PRINT(" %s : gpio_requset reset pin failed \n", __func__);
-				goto egisfp_reset_request_fail;
+			status = gpio_request(egistec->rstPin, "egistec-reset-gpio");
+			if (status < 0) {
+				pr_err("%s gpio_requset egistec_Reset failed\n",	__func__);
+				if (egistec->pwr_by_gpio)
+					gpio_free(egistec->vcc_33v_Pin);
+				return status;
 			}
+			pinctrl_select_state(egistec->pinctrl, egistec->reset_low);
 
-			status = gpio_direction_output(egis_dev->rstPin, 0);
-
-			status = gpio_request(egis_dev->irqPin, "egis_dev-irq-gpio");
-			if (status < 0)
-			{
-				ERROR_PRINT(" %s : gpio_requset irq pin failed \n", __func__);
-				goto egisfp_irq_request_fail;
+			status = gpio_request(egistec->irqPin, "egistec-irq-gpio");
+			if (status < 0) {
+				pr_err("%s gpio_requset egistec_Irq failed\n",	__func__);
+				gpio_free(egistec->rstPin);
+				if (egistec->pwr_by_gpio)
+					gpio_free(egistec->vcc_33v_Pin);
+				return status;
 			}
-
-			gpio_direction_input(egis_dev->irqPin);
-
-			if (egis_dev->dd)
-			{
-				INFO_PRINT(" %s : find node enter \n", __func__);
-				egis_dev->pinctrl = devm_pinctrl_get(&egis_dev->dd->dev);
-				if (IS_ERR(egis_dev->pinctrl))
-				{
-					status = PTR_ERR(egis_dev->pinctrl);
-					ERROR_PRINT(" %s : can't find fingerprint pinctrl \n", __func__);
-					goto egisfp_pinctrl_fail;
-				}
-				egis_dev->reset_high = pinctrl_lookup_state(egis_dev->pinctrl, "egis_rst_high");
-				if (IS_ERR(egis_dev->reset_high))
-				{
-					status = PTR_ERR(egis_dev->reset_high);
-					ERROR_PRINT(" %s : can't find fingerprint pinctrl egis_rst_high \n", __func__);
-					goto egisfp_pinctrl_fail;
-				}
-				egis_dev->reset_low = pinctrl_lookup_state(egis_dev->pinctrl, "egis_rst_low");
-				if (IS_ERR(egis_dev->reset_low))
-				{
-					status = PTR_ERR(egis_dev->reset_low);
-					ERROR_PRINT(" %s : can't find fingerprint pinctrl egis_rst_low \n", __func__);
-					goto egisfp_pinctrl_fail;
-				}
-				if (pinctrl_select_state(egis_dev->pinctrl, egis_dev->reset_low))
-					goto egisfp_pinctrl_fail;
-				egis_dev->irq_active = pinctrl_lookup_state(egis_dev->pinctrl, "egis_irq_active");
-				if (IS_ERR(egis_dev->irq_active))
-				{
-					status = PTR_ERR(egis_dev->irq_active);
-					ERROR_PRINT(" %s : can't find fingerprint pinctrl egis_irq_active \n", __func__);
-					goto egisfp_pinctrl_fail;
-				}
-				if (pinctrl_select_state(egis_dev->pinctrl, egis_dev->irq_active))
-					goto egisfp_pinctrl_fail;
-				if (egis_dev->pwr_by_gpio && egis_dev->ctrl_power)
-				{
-					egis_dev->vcc_high = pinctrl_lookup_state(egis_dev->pinctrl, "egis_vcc_high");
-					if (IS_ERR(egis_dev->vcc_high))
-					{
-						status = PTR_ERR(egis_dev->vcc_high);
-						ERROR_PRINT(" %s : can't find fingerprint pinctrl egis_vcc_high \n", __func__);
-						goto egisfp_pinctrl_fail;
-					}
-					egis_dev->vcc_low = pinctrl_lookup_state(egis_dev->pinctrl, "egis_vcc_low");
-					if (IS_ERR(egis_dev->vcc_low))
-					{
-						status = PTR_ERR(egis_dev->vcc_low);
-						ERROR_PRINT(" %s : can't find fingerprint pinctrl egis_vcc_low \n", __func__);
-						goto egisfp_pinctrl_fail;
-					}
-					if (pinctrl_select_state(egis_dev->pinctrl, egis_dev->vcc_low))
-						goto egisfp_pinctrl_fail;
-				}
-			}
-
-
-
-			egis_dev->platforminit_done = 1;
-			if (egis_dev->pwr_by_gpio && egis_dev->ctrl_power)
-				INFO_PRINT(" %s : successful status = %d gpio num -> vcc = %d rst = %d Irq = %d \n", __func__, status, egis_dev->vcc_33v_Pin, egis_dev->rstPin, egis_dev->irqPin);
+			egistec->egistec_platformInit_done = 1;
+			if (egistec->pwr_by_gpio)
+				pr_info("%s successful status=%d gpio num -> vcc = %d rst = %d Irq = %d \n", __func__, status, egistec->vcc_33v_Pin, egistec->rstPin, egistec->irqPin);
 			else
-				INFO_PRINT(" %s : successful status = %d gpio num -> rst = %d Irq = %d \n", __func__, status, egis_dev->rstPin, egis_dev->irqPin);
+				pr_info("%s successful status=%d gpio num -> rst = %d Irq = %d \n", __func__, status, egistec->rstPin, egistec->irqPin);
+		} else {
+			pr_info("%s platform already init ! \n", __func__);
 		}
-		else
-		{
-			INFO_PRINT(" %s : platform already init \n", __func__);
-		}
-		return 0;
-	}
-	else
-	{
-		ERROR_PRINT(" %s : device node is null \n", __func__);
-		return -ENODEV;
-	}
-egisfp_pinctrl_fail:
-	ERROR_PRINT(" %s : devm_pinctrl_put \n", __func__);
-	devm_pinctrl_put(egis_dev->pinctrl);
-	egis_dev->pinctrl = NULL;
-	gpio_free(egis_dev->irqPin);
-egisfp_irq_request_fail:
-	gpio_free(egis_dev->rstPin);
-egisfp_reset_request_fail:
-egisfp_power_setup_fail:
-	if (egis_dev->ctrl_power)
-	{
-		if (egis_dev->pwr_by_gpio)
-			gpio_free(egis_dev->vcc_33v_Pin);
-		else
-			devm_regulator_put(egis_dev->vcc);
 
-		if (egis_dev->ext_ldo_source)
-			devm_regulator_put(egis_dev->vcc);
 	}
-egisfp_power_request_fail:
-	return -EIO;
+
+	return status;
 }
 
-int egisfp_check_ioctl_permission(struct egisfp_dev_t *egis_dev, unsigned int cmd)
+int egistec_parse_dt(struct egistec_data *data)
 {
-
-	if (cmd == FP_GET_RESOURCE || cmd == FP_FREE_RESOURCE)
-	{
-		return 0;
-	}
-	else if (egis_dev->platforminit_done)
-	{
-		return 0;
-	}
-	else
-	{
-		ERROR_PRINT(" %s : need get resource fisrt \n", __func__);
-		return -EACCES;
-	}
-}
-
-int egisfp_parse_dt(struct egisfp_dev_t *egis_dev)
-{
+#ifdef CONFIG_OF
 	int ret;
-	struct device_node *node = egis_dev->dd->dev.of_node;
-	u32 voltage_supply[2];
-	u32 current_supply;
-	ERROR_PRINT(" %s : start \n", __func__);
-
-	if (node)
-	{
-		ERROR_PRINT(" %s : %d \n", __func__,__LINE__);
-
-		egis_dev->ctrl_power = of_property_read_bool(node, "fp-ctrl-power");
-		if (egis_dev->ctrl_power)
-		{
-			ERROR_PRINT(" %s : %d \n", __func__,__LINE__);
-			egis_dev->pwr_by_gpio = of_property_read_bool(node, "fp-gpio-vcc-enable");
-			if (egis_dev->pwr_by_gpio)
-			{
-				ERROR_PRINT(" %s : %d \n", __func__,__LINE__);
-				egis_dev->vcc_33v_Pin = of_get_named_gpio(node, "egistec,gpio_vcc_en", 0);
-				ERROR_PRINT(" %s : vcc_33v_pin gpio num is %d \n", __func__, egis_dev->vcc_33v_Pin);
-				if (!gpio_is_valid(egis_dev->vcc_33v_Pin))
-				{
-					ERROR_PRINT(" %s : vcc_33v_pin gpio is invalid \n", __func__);
-					return -ENODEV;
-				}
+	struct device_node *node = data->dd->dev.of_node;
+    u32 voltage_supply[2];
+    u32 current_supply;
+ 	ret =  -ENODEV;
+	pr_info("egistec_parse_dt start \n");
+	if (node) {
+		data->pwr_by_gpio = of_property_read_bool(node, "fp-gpio-vcc-enable");
+		if (data->pwr_by_gpio) {
+			data->vcc_33v_Pin = of_get_named_gpio(node, "egistec,gpio_vcc_en", 0);
+			pr_info("vcc_33v_Pin GPIO is %d.  -----\n", data->vcc_33v_Pin);
+			if (!gpio_is_valid(data->vcc_33v_Pin)) {
+				pr_err("vcc_33v_Pin GPIO is invalid.\n");
+				return -ENODEV;
 			}
-			else
-			{
-				ret = of_property_read_u32_array(node, "egis-fp,vcc-voltage", voltage_supply, 2);
-				if (ret < 0)
-				{
-					ERROR_PRINT(" %s : fail to get vcc regulator voltage \n", __func__);
-					return -ENODEV;
-				}
-				INFO_PRINT(" %s : vcc regulator voltage get Max = %d, Min = %d \n", __func__, voltage_supply[1], voltage_supply[0]);
-				egis_dev->regulator_voltage_max = voltage_supply[1];
-				egis_dev->regulator_voltage_min = voltage_supply[0];
-
-				ret = of_property_read_u32_array(node, "egis-fp,vcc-current", &current_supply, 1);
-				if (ret < 0)
-				{
-					ERROR_PRINT("  %s : fail to get vcc regulator current_supply \n", __func__);
-					return -ENODEV;
-				}
-				INFO_PRINT(" %s : vcc regulator current get %d \n", __func__, current_supply);
-				egis_dev->regulator_current = current_supply;
+		} else {
+			ret = of_property_read_u32_array(node, "egis-fp,vcc-voltage", voltage_supply, 2);
+			if (ret < 0) {
+				printk("Failed to get regulator fp vcc voltage !\n");
+				return -ENODEV;
 			}
-			egis_dev->ext_ldo_source = of_property_read_bool(node, "fp-gpio-ext-ldo");
-			if (egis_dev->ext_ldo_source) {
-				INFO_PRINT(" %s : Config Regulator for ext_ldo_source \n", __func__);
-				ret = of_property_read_u32_array(node, "egis-fp,vcc-voltage", voltage_supply, 2);
-				if (ret < 0) {
-					ERROR_PRINT(" %s : fail to get vcc regulator voltage \n", __func__);
+			printk("[FP] Regulator voltage get Max = %d, Min = %d \n", voltage_supply[1], voltage_supply[0]);
+			data->regulator_max_voltage = voltage_supply[1];
+			data->regulator_min_voltage = voltage_supply[0];
+			data->max_voltage = voltage_supply[1];
+			ret = of_property_read_u32_array(node, "egis-fp,vcc-current", &current_supply, 1);
+			if (ret < 0) {
+				printk("Failed to get regulator fp vcc voltage !\n");
+				return -ENODEV;
+			}
+			printk("[FP] Regulator current get  %d \n", current_supply);
+			data->regulator_current = current_supply;
+
+			data->vcc = devm_regulator_get(&data->dd->dev, "egis-vcc");
+			if (IS_ERR( data->vcc)) {
+				ret = PTR_ERR(data->vcc);
+				printk("[FP] Regulator get fp vcc failed rc=%d\n", ret);
+				return -ENODEV;
+			}
+			if (regulator_count_voltages(data->vcc) > 0) {
+				ret = regulator_set_voltage(data->vcc, data->regulator_min_voltage,  data->max_voltage);
+				if (ret) {
+					printk("[FP] Regulator set_fp_vcc failed vdd ret=%d\n", ret);
 					return -ENODEV;
 				}
-				INFO_PRINT(" %s : vcc regulator voltage get Max = %d, Min = %d \n", __func__, voltage_supply[1], voltage_supply[0]);
-				egis_dev->regulator_voltage_max = voltage_supply[1];
-				egis_dev->regulator_voltage_min = voltage_supply[0];
-				ret = of_property_read_u32_array(node, "egis-fp,vcc-current", &current_supply, 1);
-				if (ret < 0) {
-					ERROR_PRINT("  %s : fail to get vcc regulator current_supply \n", __func__);
+
+				ret = regulator_set_load(data->vcc, data->regulator_current);
+				if (ret) {
+					printk("[FP] Regulator set_fp_vcc current failed vdd ret=%d\n", ret);
 					return -ENODEV;
 				}
-				INFO_PRINT(" %s : vcc regulator current get %d \n", __func__, current_supply);
-				egis_dev->regulator_current = current_supply;
-				ret = of_property_read_u32_array(node, "egis-fp,vcc-max-voltage", &current_supply, 1);
-				if (ret < 0) {
-					ERROR_PRINT("  %s : fail to get regulator fp vcc max voltage \n", __func__);
+
+			}
+
+		}
+
+		data->ext_ldo_source = of_property_read_bool(node, "fp-gpio-ext-ldo");
+		if (data->ext_ldo_source) {
+			printk("[FP] Config Regulator for ext_ldo_source \n");
+			ret = of_property_read_u32_array(node, "egis-fp,vcc-voltage", voltage_supply, 2);
+			if (ret < 0) {
+				printk("Failed to get regulator fp vcc voltage !\n");
+				return -ENODEV;
+			}
+			printk("[FP] Regulator voltage get Max = %d, Min = %d \n", voltage_supply[1], voltage_supply[0]);
+			data->regulator_max_voltage = voltage_supply[1];
+			data->regulator_min_voltage = voltage_supply[0];
+
+			ret = of_property_read_u32_array(node, "egis-fp,vcc-current", &current_supply, 1);
+			if (ret < 0) {
+				printk("Failed to get regulator fp vcc current !\n");
+				return -ENODEV;
+			}
+			printk("[FP] Regulator current get  %d \n", current_supply);
+			data->regulator_current = current_supply;
+
+			ret = of_property_read_u32_array(node, "egis-fp,vcc-max-voltage", &current_supply, 1);
+			if (ret < 0) {
+				printk("Failed to get regulator fp vcc max voltage !\n");
+				return -ENODEV;
+			}
+			printk("[FP] Regulator max voltage get  %d \n", current_supply);
+			data->max_voltage = current_supply;
+
+			data->vcc = devm_regulator_get(&data->dd->dev, "egis-vcc");
+			if (IS_ERR( data->vcc)) {
+				ret = PTR_ERR(data->vcc);
+				printk("[FP] Regulator get fp vcc failed rc=%d\n", ret);
+				return -ENODEV;
+			}
+			if (regulator_count_voltages(data->vcc) > 0) {
+				ret = regulator_set_voltage(data->vcc, data->regulator_min_voltage,  data->max_voltage);
+				if (ret) {
+					printk("[FP] Regulator set_fp_vcc failed vdd ret=%d\n", ret);
 					return -ENODEV;
 				}
-				INFO_PRINT(" %s : regulator max voltage get = %d \n", __func__, current_supply);
-				egis_dev->max_voltage = current_supply;
+
+				ret = regulator_set_load(data->vcc, data->regulator_current);
+				if (ret) {
+					printk("[FP] Regulator set_fp_vcc current failed vdd ret=%d\n", ret);
+					return -ENODEV;
+				}
+
 			}
 		}
 
-		egis_dev->rstPin = of_get_named_gpio(node, "egistec,gpio_reset", 0);
-		INFO_PRINT(" %s : rst pin gpio num is %d \n", __func__, egis_dev->rstPin);
-		if (!gpio_is_valid(egis_dev->rstPin))
-		{
-			ERROR_PRINT(" %s : rst pin gpio is invalid \n", __func__);
+		if (data->dd) {
+			pr_info("egistec find node enter\n");
+			data->pinctrl = devm_pinctrl_get(&data->dd->dev);
+			if (IS_ERR(data->pinctrl)) {
+				ret = PTR_ERR(data->pinctrl);
+				pr_err("can't find fingerprint pinctrl\n");
+				return ret;
+			}
+
+			data->reset_high = pinctrl_lookup_state(data->pinctrl, "egis_rst_active");
+			if (IS_ERR(data->reset_high)) {
+				ret = PTR_ERR(data->reset_high);
+				pr_err("can't find fingerprint pinctrl egis_rst_active\n");
+				return ret;
+			}
+
+			data->reset_low = pinctrl_lookup_state(data->pinctrl, "egis_rst_sleep");
+			if (IS_ERR(data->reset_low)) {
+				ret = PTR_ERR(data->reset_low);
+				pr_err("can't find fingerprint pinctrl egis_rst_sleep\n");
+				return ret;
+			}
+
+			data->irq_active = pinctrl_lookup_state(data->pinctrl, "egis_irq_active");
+			if (IS_ERR(data->irq_active)) {
+				ret = PTR_ERR(data->irq_active);
+				pr_err("can't find fingerprint pinctrl irq_active\n");
+				return ret;
+			}
+
+			data->irq_low = pinctrl_lookup_state(data->pinctrl, "egis_irq_low");
+			if (IS_ERR(data->irq_low)) {
+				ret = PTR_ERR(data->irq_low);
+				pr_err("can't find fingerprint pinctrl irq_low\n");
+				return ret;
+			}
+
+			if (data->pwr_by_gpio) {
+
+				data->vcc_high = pinctrl_lookup_state(data->pinctrl, "egis_vcc_high");
+				if (IS_ERR(data->vcc_high)) {
+					ret = PTR_ERR(data->vcc_high);
+					pr_err("can't find fingerprint pinctrl fp_vcc_high\n");
+					return ret;
+				}
+
+				data->vcc_low = pinctrl_lookup_state(data->pinctrl, "egis_vcc_low");
+				if (IS_ERR(data->vcc_low)) {
+					ret = PTR_ERR(data->vcc_low);
+					pr_err("can't find fingerprint pinctrl fp_vcc_low\n");
+					return ret;
+				}
+
+				pinctrl_select_state(data->pinctrl, data->vcc_low);
+
+			}
+
+			pinctrl_select_state(data->pinctrl, data->reset_low);
+
+			pinctrl_select_state(data->pinctrl, data->irq_low);
+
+		}
+
+		data->rstPin = of_get_named_gpio(node, "egistec,gpio_reset", 0);
+		pr_info("RST Pin GPIO is %d.  -----\n", data->rstPin);
+		if (!gpio_is_valid(data->rstPin)) {
+			pr_err("RST Pin GPIO is invalid.\n");
 			return -ENODEV;
 		}
 
-		egis_dev->irqPin = of_get_named_gpio(node, "egistec,gpio_irq", 0);
-		INFO_PRINT(" %s : irq pin gpio num is %d \n", __func__, egis_dev->irqPin);
-		if (!gpio_is_valid(egis_dev->irqPin))
-		{
-			ERROR_PRINT(" %s : irq pin gpio is invalid \n", __func__);
+		data->irqPin = of_get_named_gpio(node, "egistec,gpio_irq", 0);
+		pr_info("IRQ Pin GPIO is %d.  -----\n", data->irqPin);
+		if (!gpio_is_valid(data->irqPin)) {
+			pr_err("irq_Pin GPIO is invalid.\n");
 			return -ENODEV;
 		}
-	}
-	else
-	{
-		ERROR_PRINT(" %s : device node is null \n", __func__);
+#if defined(MTK_PLATFORM) || defined(SAMSUNG_PLATFORM)
+		if (data->dd) {
+			pr_info("egistec find node enter\n");
+			data->pinctrl = devm_pinctrl_get(&data->dd->dev);
+			if (IS_ERR(data->pinctrl)) {
+				ret = PTR_ERR(data->pinctrl);
+				pr_err("can't find fingerprint pinctrl\n");
+				return ret;
+			}
+
+			data->spi_active = pinctrl_lookup_state(data->pinctrl, "egis_spi_active");
+			if (IS_ERR(data->spi_active)) {
+				ret = PTR_ERR(data->spi_active);
+				pr_err("can't find fingerprint pinctrl spi_active\n");
+				return ret;
+			}
+
+			data->spi_default = pinctrl_lookup_state(data->pinctrl, "egis_spi_default");
+			if (IS_ERR(data->spi_default)) {
+				ret = PTR_ERR(data->spi_default);
+				pr_err("can't find fingerprint pinctrl spi_default\n");
+				return ret;
+			}
+
+			pr_info("%s, get pinctrl success!\n");
+		} else {
+			pr_err(" device is null\n");
+		}
+#endif
+	} else {
+		pr_err("device node is null\n");
 		return -ENODEV;
 	}
-	INFO_PRINT(" %s : successful \n", __func__);
-
+#endif
+	pr_info(" is successful\n");
 	return 0;
 }
 
-const struct file_operations egisfp_fops = {
+const struct file_operations egistec_fops = {
 	.owner = THIS_MODULE,
-	.unlocked_ioctl = egisfp_ioctl,
-	.compat_ioctl = egisfp_compat_ioctl,
-	.open = egisfp_open,
-	.release = egisfp_release,
+#ifdef PLATFORM_SPI
+	.write = egistec_write,
+	.read = egistec_read,
+#endif
+	.unlocked_ioctl = egistec_ioctl,
+	.compat_ioctl = egistec_compat_ioctl,
+	.open = egistec_open,
+	.release = egistec_release,
 	.llseek = no_llseek,
-	.poll = egisfp_interrupt_poll};
+	.poll = fps_interrupt_poll
+};
 
 /*-------------------------------------------------------------------------*/
-struct class *egisfp_class;
+struct class *egistec_class;
 /*-------------------------------------------------------------------------*/
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+int egistec_probe(struct spi_device *spi);
+int egistec_remove(struct spi_device *spi);
+#else
+int egistec_probe(struct platform_device *pdev);
+int egistec_remove(struct platform_device *pdev);
+#endif
 
-int egisfp_remove(struct platform_device *pdev)
+/* -------------------------------------------------------------------- */
+
+
+struct of_device_id egistec_match_table[] = {
+	{ .compatible = "fp-egistec",},
+	{},
+};
+
+
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+static struct spi_driver egis_driver = {
+#else
+static struct platform_driver egis_driver = {
+#endif
+    .driver = {
+        .name = EGIS_DEV_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = egistec_match_table,
+    },
+    .probe = egistec_probe,
+    .remove = egistec_remove,
+};
+
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+int egistec_remove(struct spi_device *spi)
+#else
+int egistec_remove(struct platform_device *pdev)
+#endif
 {
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+	struct device *dev = &spi->dev;
+	struct egistec_data *egistec = dev_get_drvdata(dev);
+#else
 	struct device *dev = &pdev->dev;
-	struct egisfp_dev_t *egis_dev = dev_get_drvdata(dev);
-	INFO_PRINT(" %s : driver remove \n", __func__);
-	if (egis_dev->request_irq_done)
-	{
-		free_irq(egis_dev->gpio_irq, egis_dev);
-	}
-	del_timer_sync(&egis_dev->fps_ints.timer);
+	struct egistec_data *egistec = dev_get_drvdata(dev);
+#endif
+	DEBUG_PRINT("%s(#%d)\n", __func__, __LINE__);
+	if (egistec->request_irq_done)
+		free_irq(egistec->gpio_irq, egistec);
+	device_init_wakeup(&egistec->dd->dev, 0);
+	del_timer_sync(&fps_ints.timer);
+	egistec->request_irq_done = 0;
 
-	device_init_wakeup(&egis_dev->dd->dev, 0);
+	device_destroy(egistec_class, egistec->devt);
 
-	egis_dev->request_irq_done = 0;
+	list_del(&egistec->device_entry);
 
-	if (egis_dev->input_dev)
-	{
-		input_unregister_device(egis_dev->input_dev);
-	}
+	class_destroy(egistec_class);
 
-	device_destroy(egisfp_class, egis_dev->devt);
-
-	list_del(&egis_dev->device_entry);
-
-	class_destroy(egisfp_class);
-
-	unregister_chrdev(EGIS_FP_MAJOR, egisfp_driver.driver.name);
+	unregister_chrdev(EGIS_FP_MAJOR, egis_driver.driver.name);
 
 	g_data = NULL;
 	return 0;
 }
 
-int egisfp_probe(struct platform_device *pdev)
+
+
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+int egistec_probe(struct spi_device *spi)
+#else
+int egistec_probe(struct platform_device *pdev)
+#endif
 {
-	struct egisfp_dev_t *egis_dev;
-	int status, i;
+	struct egistec_data *egistec;
+	int status = 0;
 	unsigned long minor;
 
-	INFO_PRINT(" %s : driver init \n", __func__);
+	pr_info("[Egis] driver init ! \n");
 	BUILD_BUG_ON(N_SPI_MINORS > 256);
-	status = register_chrdev(EGIS_FP_MAJOR, EGIS_CHRD_DRIVER_NAME, &egisfp_fops);
-	if (status < 0)
-	{
-		ERROR_PRINT(" %s : register_chrdev error \n", __func__);
-		return status;
+	status = register_chrdev(EGIS_FP_MAJOR, EGIS_CHRD_DRIVER_NAME, &egistec_fops);
+	if (status < 0) {
+			pr_err("%s register_chrdev error.\n", __func__);
+			return status;
 	}
-	egisfp_class = class_create(THIS_MODULE, EGIS_CLASS_NAME);
-	if (IS_ERR(egisfp_class))
-	{
-		ERROR_PRINT(" %s : class_create error \n", __func__);
-		unregister_chrdev(EGIS_FP_MAJOR, egisfp_driver.driver.name);
-		return PTR_ERR(egisfp_class);
+	egistec_class = class_create(THIS_MODULE, EGIS_CLASS_NAME);
+	if (IS_ERR(egistec_class)) {
+		pr_err("%s class_create error.\n", __func__);
+		unregister_chrdev(EGIS_FP_MAJOR, egis_driver.driver.name);
+		return PTR_ERR(egistec_class);
 	}
 	/* Allocate driver data */
-	egis_dev = kzalloc(sizeof(struct egisfp_dev_t), GFP_KERNEL);
-	if (egis_dev == NULL)
-	{
-		ERROR_PRINT(" %s : Failed to kzalloc \n", __func__);
+	egistec = kzalloc(sizeof(struct egistec_data), GFP_KERNEL);
+	if (egistec == NULL) {
+		pr_err("%s - Failed to kzalloc\n", __func__);
 		return -ENOMEM;
 	}
 /* Initialize the driver data */
-	dev_set_drvdata(&pdev->dev, egis_dev);
-	egis_dev->dd = pdev;
-
-
-	spin_lock_init(&egis_dev->irq_lock);
-
-	device_init_wakeup(&egis_dev->dd->dev, 1);
-
-	mutex_init(&device_list_lock);
-
-	INIT_LIST_HEAD(&egis_dev->device_entry);
-
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+	dev_set_drvdata(&spi->dev, egistec);
+	egistec->dd = spi;
+	spi->bits_per_word = 8;
+	spi->max_speed_hz = 50000000;
+	spi->mode = SPI_MODE_0;
+	spi->chip_select = 0;
+	status = spi_setup(spi);
+	if (status != 0) {
+		pr_err("%s spi_setup() is failed. status : %d\n", __func__, status);
+		return status;
+	}
+#else
+	dev_set_drvdata(&pdev->dev, egistec);
+	egistec->dd = pdev;
+#endif
 	/* init status */
-	egis_dev->pars_dtsi_done = 0;
-	egis_dev->fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
-	egis_dev->fps_ints.irq_wakeup_enable = DRDY_IRQ_DISABLE;
-	egis_dev->clk_enabled = 0;
-	egis_dev->request_irq_done = 0;
-	egis_dev->platforminit_done = 0;
-	egis_dev->power_enable = 0;
-	egis_dev->screen_onoff = 1;	// dafault set screen on
-	egis_dev->call_back_registered = 0;
-	egis_dev->fps_ints.irq_mode = -1;
+	egistec->power_enable = false;
+
+	/* device tree call */
+	if (egistec->dd->dev.of_node) {
+		status = egistec_parse_dt(egistec);
+	}
+
+	if (status < 0) {
+		pr_err("%s - parse_dt fail\n", __func__);
+		goto egistec_probe_failed;
+	}
+
+	g_data = egistec;
+    spin_lock_init(&egistec->irq_lock);
+	device_init_wakeup(&egistec->dd->dev, 1);
+	mutex_init(&device_list_lock);
+	mutex_init(&egistec->buf_lock);
+	INIT_LIST_HEAD(&egistec->device_entry);
+
+
+	/* +++ add for clk enable from kernel +++ */
+#ifdef SAMSUNG_PLATFORM
+	/* init spi clock */
+	if (exyons_clk_init(egistec->dd->dev, egis))
+		goto egis_probe_clk_init_failed;
+	/* Enable spi clock */
+	if (exyons_clk_enable(egis))
+		goto egis_probe_clk_enable_failed;
+
+		exyons_clk_disable(egis);
+
+#endif
 	/*
 	 * If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
 	 */
 	mutex_lock(&device_list_lock);
 	minor = find_first_zero_bit(minors, N_SPI_MINORS);
-	if (minor < N_SPI_MINORS)
-	{
+	if (minor < N_SPI_MINORS) {
 		struct device *fdev;
-		egis_dev->devt = MKDEV(EGIS_FP_MAJOR, minor);
-		fdev = device_create(egisfp_class, &egis_dev->dd->dev, egis_dev->devt,
-							 egis_dev, EGIS_DEV_NAME);
+		egistec->devt = MKDEV(EGIS_FP_MAJOR, minor);
+		fdev = device_create(egistec_class, &egistec->dd->dev, egistec->devt,
+					egistec, EGIS_DEV_NAME);
 		status = IS_ERR(fdev) ? PTR_ERR(fdev) : 0;
-	}
-	else
-	{
-		ERROR_PRINT(" %s : no minor number available \n", __func__);
+	} else {
+		dev_dbg(&egistec->dd->dev, "no minor number available!\n");
 		status = -ENODEV;
 	}
-	if (status == 0)
-	{
+	if (status == 0) {
 		set_bit(minor, minors);
-		list_add(&egis_dev->device_entry, &device_list);
+		list_add(&egistec->device_entry, &device_list);
 	}
 
 	mutex_unlock(&device_list_lock);
 
-	if (status)
-	{
+	if (status == 0) {
+
+	} else {
 		goto egistec_probe_failed;
 	}
-
-	egis_dev->input_dev = input_allocate_device();
-	if (egis_dev->input_dev == NULL)
-	{
-		ERROR_PRINT(" %s : failed to allocate input device \n", __func__);
-		status = -ENOMEM;
-		goto egistec_probe_failed;
-	}
-	for (i = 0; i < ARRAY_SIZE(key_maps); i++)
-		input_set_capability(egis_dev->input_dev, key_maps[i].type, key_maps[i].code);
-
-	egis_dev->input_dev->name = EGIS_INPUT_NAME;
-	status = input_register_device(egis_dev->input_dev);
-	if (status)
-	{
-		ERROR_PRINT(" %s : failed to register input device %d \n", __func__, status);
-		goto egistec_input_failed;
-	}
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	timer_setup(&egis_dev->fps_ints.timer, egisfp_interrupt_timer_call, 0);
-#else
-	setup_timer(&egis_dev->fps_ints.timer, egisfp_interrupt_timer_call, (unsigned long)&egis_dev->fps_ints);
-#endif
-
-
-	g_data = egis_dev;
-
-	DEBUG_PRINT(" %s : initialize success %d\n", __func__, status);
-
+	fps_ints.drdy_irq_flag = DRDY_IRQ_DISABLE;
+	timer_setup(&fps_ints.timer, interrupt_timer_routine, 0);
+	add_timer(&fps_ints.timer);
+	DEBUG_PRINT("%s : initialize success %d\n", __func__, status);
+	egistec->request_irq_done = 0;
 	return status;
 
-egistec_input_failed:
-	if (egis_dev->input_dev != NULL)
-		input_free_device(egis_dev->input_dev);
+#ifdef SAMSUNG_PLATFORM
+egis_probe_clk_enable_failed:
+egis_probe_clk_init_failed:
+#endif
 egistec_probe_failed:
-	device_destroy(egisfp_class, egis_dev->devt);
-	class_destroy(egisfp_class);
-	kfree(egis_dev);
-	ERROR_PRINT(" %s : driver probe failed %d \n", __func__, status);
+	device_destroy(egistec_class, egistec->devt);
+	class_destroy(egistec_class);
+	kfree(egistec);
+	DEBUG_PRINT("%s is failed\n", __func__);
 	return status;
 }
 
-int __init egisfp_init(void)
+
+int __init egis7xx_init(void)
 {
-	int status;
-	INFO_PRINT(" %s : module init \n", __func__);
-	status = platform_driver_register(&egisfp_driver);
-	if (status)
-	{
-		ERROR_PRINT(" %s : register Egis driver fail \n", __func__);
+	int status = 0;
+	pr_info("[Egis] module init ! \n");
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+	status = spi_register_driver(&egis_driver);
+#else
+	status = platform_driver_register(&egis_driver);
+#endif
+	if (status < 0) {
+		pr_err("register Egis driver fail%s\n", __func__);
 		return -EINVAL;
 	}
-	INFO_PRINT(" %s : module init OK ! \n", __func__);
+	pr_info(" [Egis] module init OK ! \n");
 	return status;
 }
-void __exit egisfp_exit(void)
+void __exit egis7xx_exit(void)
 {
-	INFO_PRINT("module exit \n");
-	platform_driver_unregister(&egisfp_driver);
+	pr_info(" [Egis] module exit ! \n");
+#if defined(MTK_PLATFORM) || defined(PLATFORM_SPI)
+	  spi_unregister_driver(&egis_driver);
+#else
+	  platform_driver_unregister(&egis_driver);
+#endif
 }
+module_init(egis7xx_init);
+module_exit(egis7xx_exit);
 
-module_init(egisfp_init);
-module_exit(egisfp_exit);
-
-MODULE_DESCRIPTION("egis fingerprint driver");
+MODULE_AUTHOR("Jacob Kung");
+MODULE_DESCRIPTION("Platform driver for ET603");
 MODULE_LICENSE("GPL");
