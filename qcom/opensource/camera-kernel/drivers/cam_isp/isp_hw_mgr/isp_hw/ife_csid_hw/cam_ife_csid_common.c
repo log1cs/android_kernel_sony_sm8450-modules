@@ -243,10 +243,6 @@ int cam_ife_csid_get_format_rdi(
 		break;
 	case CAM_FORMAT_MIPI_RAW_12:
 		path_format->decode_fmt = 0x3;
-/* sony extension begin */
-		if (out_format==CAM_FORMAT_PLAIN128)
-			path_format->decode_fmt = 0xf;
-/* sony extension end */
 		path_format->bits_per_pxl = 12;
 		break;
 	case CAM_FORMAT_MIPI_RAW_14:
@@ -309,6 +305,12 @@ int cam_ife_csid_get_format_rdi(
 		rc = -EINVAL;
 		goto err;
 	}
+
+/* sony extension begin */
+	if (in_format==CAM_FORMAT_MIPI_RAW_12 && out_format==CAM_FORMAT_PLAIN128) {
+		path_format->decode_fmt = 0xf;
+	}
+/* sony extension end */
 
 end:
 	CAM_DBG(CAM_ISP,
