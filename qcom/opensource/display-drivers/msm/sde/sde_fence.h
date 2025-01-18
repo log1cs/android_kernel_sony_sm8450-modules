@@ -52,6 +52,8 @@ enum sde_fence_event {
 	SDE_FENCE_SIGNAL_ERROR
 };
 
+int sde_kmem_pool_init(void);
+
 #if IS_ENABLED(CONFIG_SYNC_FILE)
 /**
  * sde_sync_get - Query sync fence object from a file handle
