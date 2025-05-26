@@ -15,7 +15,7 @@ ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_sensor_module/cam_sensor_utils
 ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_smmu
 ccflags-y += -I$(CAMERA_KERNEL_ROOT)/drivers/cam_req_mgr
 ccflags-y += -DCONFIG_SPECTRA_CAMERA=y
-ifeq ($(findstring pdx223, $(PRODUCT)), pdx223)
+ifeq ($(CONFIG_MACH_SONY_PDX223), y)
 ccflags-y += -DUSE_CAMERA_4
 endif
 
