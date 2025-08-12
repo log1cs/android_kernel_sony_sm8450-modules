@@ -2340,6 +2340,7 @@ static void __exit msm_drm_unregister(void)
 	dsi_display_unregister();
 	sde_rsc_unregister();
 	platform_driver_unregister(&msm_platform_driver);
+	sde_kmem_pool_destroy();
 }
 
 module_init(msm_drm_register);

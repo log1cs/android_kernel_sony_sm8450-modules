@@ -516,9 +516,12 @@ void sde_debugfs_timeline_dump(struct sde_fence_context *ctx,
 	spin_unlock(&ctx->list_lock);
 }
 
-int sde_kmem_pool_init(void)
+void sde_kmem_pool_init(void)
 {
     kmem_fence_pool = KMEM_CACHE(sde_fence, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
-    return 0;
 }
 
+void sde_kmem_pool_destroy(void)
+{
+	kmem_cache_destroy(kmem_fence_pool);
+}
