@@ -203,7 +203,6 @@ static int cs40l2x_a2h_ev(struct snd_soc_dapm_widget *w,
 	struct cs40l2x_codec *priv = snd_soc_component_get_drvdata(comp);
 	struct cs40l2x_private *core = priv->core;
 	unsigned int reg;
-	int ret;
 
 	if (!core->dsp_reg)
 		return 0;
@@ -217,12 +216,6 @@ static int cs40l2x_a2h_ev(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
-		ret = cs40l2x_ack_write(core, CS40L2X_MBOX_USER_CONTROL,
-					CS40L2X_USER_CTRL_REINIT_A2H,
-					CS40L2X_USER_CTRL_SUCCESS);
-		if (ret)
-			return ret;
-
 		return regmap_write(priv->regmap, reg, CS40L2X_A2H_ENABLE);
 	case SND_SOC_DAPM_PRE_PMD:
 		return regmap_write(priv->regmap, reg, CS40L2X_A2H_DISABLE);
